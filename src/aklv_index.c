@@ -33,6 +33,8 @@
 #define AKLV_INDEX_CACHE_HEADER_SIZE 4096
 #define AKLV_CACHE_STREAM_BUFFER_BYTES (50 * 1024 * 1024)
 #define AKLV_CACHE_OFFSET_CONVERT_BATCH (8192 * 50)
+#define AKLV_CACHE_STREAM_CHUNK_BYTES (16 * 1024 * 1024)
+#define AKLV_CACHE_STREAM_QUEUE_MAX_BYTES (256 * 1024 * 1024)
 #define AKLV_ASCII_GRAM_KEY_SPACE UINT64_C(2097152)
 #define AKLV_ASCII_GRAM_KEY_SPACE_WORDS (AKLV_ASCII_GRAM_KEY_SPACE / 64)
 #ifndef AKLV_WORKER_GRAM_RESERVE_BYTES_PER_GRAM
@@ -131,9 +133,53 @@ typedef struct {
     unsigned char *end;
 } AklvCachePayloadArena;
 
+typedef struct AklvCacheStreamChunk {
+    unsigned char *data;
+    size_t size;
+    struct AklvCacheStreamChunk *next;
+} AklvCacheStreamChunk;
+
+typedef struct {
+    uint64_t gram_count;
+    uint64_t total_container_count;
+    uint64_t payload_bytes;
+} AklvCacheStreamStats;
+
+typedef struct AklvCacheStreamWriter {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    bool mutex_initialized;
+    bool cond_initialized;
+    bool thread_created;
+    bool done;
+    bool aborting;
+    bool failed;
+    pthread_t thread;
+    FILE *stream;
+    unsigned char *stream_buffer;
+    char *cache_path;
+    char tmp_path[PATH_MAX];
+    char hash[33];
+    AklvCacheStreamChunk *head;
+    AklvCacheStreamChunk *tail;
+    uint64_t queued_bytes;
+    AklvIndexCacheFileHeader header;
+    AklvCacheStreamStats stats;
+    char error[256];
+} AklvCacheStreamWriter;
+
+typedef struct {
+    AklvCacheStreamWriter *writer;
+    unsigned char *data;
+    size_t size;
+    size_t capacity;
+    AklvCacheStreamStats stats;
+} AklvCacheChunkBuilder;
+
 static uint32_t aklv_gram_dense_index(uint32_t gram);
 static uint32_t aklv_lower_bound_u16(const uint16_t *items, uint32_t count, uint16_t value);
 static uint32_t aklv_effective_prefix_skip(AklvLineView line);
+static void aklv_cache_stream_emit_index(AklvCacheStreamWriter *writer, const AklvGramIndex *index);
 
 static void aklv_set_error(char *error, size_t error_cap, const char *fmt, ...) {
     if (error == NULL || error_cap == 0) {
@@ -1506,7 +1552,9 @@ typedef struct {
     uint32_t worker_count;
     uint32_t first_partition;
     uint32_t last_partition;
+    AklvCacheStreamWriter *cache_writer;
     AklvGramIndex gram_index;
+    uint64_t partition_counts[AKLV_GRAM_PARTITION_COUNT];
     uint64_t gram_count;
     int status;
     char error[256];
@@ -1561,6 +1609,7 @@ static void *aklv_partition_merge_worker_main(void *arg) {
             snprintf(task->error, sizeof(task->error), "%s", "failed to count partition index");
             return NULL;
         }
+        task->partition_counts[partition_id] = partition_count;
         if (partition_count > UINT64_MAX - merged_count) {
             task->status = -1;
             snprintf(task->error, sizeof(task->error), "%s", "partition index too large");
@@ -1577,16 +1626,35 @@ static void *aklv_partition_merge_worker_main(void *arg) {
     for (uint32_t partition_id = task->first_partition;
          partition_id < task->last_partition;
          partition_id++) {
+        if (task->partition_counts[partition_id] == 0) {
+            continue;
+        }
+        AklvGramIndex partition_index = {0};
+        if (!aklv_gram_index_reserve_for_count(&partition_index,
+                                               task->partition_counts[partition_id])) {
+            aklv_gram_index_destroy(&partition_index);
+            task->status = -1;
+            snprintf(task->error, sizeof(task->error), "%s", "failed to reserve partition index");
+            return NULL;
+        }
         for (uint32_t worker_i = 0; worker_i < task->worker_count; worker_i++) {
             if (task->workers[worker_i].partition_indexes == NULL) {
                 continue;
             }
-            if (!aklv_gram_index_merge_move(&task->gram_index,
+            if (!aklv_gram_index_merge_move(&partition_index,
                                             &task->workers[worker_i].partition_indexes[partition_id])) {
+                aklv_gram_index_destroy(&partition_index);
                 task->status = -1;
                 snprintf(task->error, sizeof(task->error), "%s", "failed to merge partition index");
                 return NULL;
             }
+        }
+        aklv_cache_stream_emit_index(task->cache_writer, &partition_index);
+        if (!aklv_gram_index_merge_move(&task->gram_index, &partition_index)) {
+            aklv_gram_index_destroy(&partition_index);
+            task->status = -1;
+            snprintf(task->error, sizeof(task->error), "%s", "failed to merge partition index");
+            return NULL;
         }
     }
     return NULL;
@@ -1596,6 +1664,7 @@ static int aklv_merge_worker_indexes_by_partition(AklvLineIndex *index,
                                                   AklvGramBuildTask *workers,
                                                   uint32_t worker_count,
                                                   uint32_t thread_count,
+                                                  AklvCacheStreamWriter *cache_writer,
                                                   const atomic_bool *cancel,
                                                   char *error,
                                                   size_t error_cap) {
@@ -1628,6 +1697,7 @@ static int aklv_merge_worker_indexes_by_partition(AklvLineIndex *index,
         tasks[i].worker_count = worker_count;
         tasks[i].first_partition = first_partition;
         tasks[i].last_partition = first_partition + count;
+        tasks[i].cache_writer = cache_writer;
         first_partition = tasks[i].last_partition;
         if (thread_count == 1) {
             aklv_partition_merge_worker_main(&tasks[i]);
@@ -2180,6 +2250,590 @@ static bool aklv_cache_write_container_payload(FILE *stream, const AklvRoaringCo
                                   container->array,
                                   (size_t)container->cardinality * sizeof(*container->array));
     }
+}
+
+static void aklv_cache_stream_chunk_free(AklvCacheStreamChunk *chunk) {
+    if (chunk == NULL) {
+        return;
+    }
+    free(chunk->data);
+    free(chunk);
+}
+
+static void aklv_cache_stream_writer_free_queue_locked(AklvCacheStreamWriter *writer) {
+    AklvCacheStreamChunk *chunk = writer->head;
+    while (chunk != NULL) {
+        AklvCacheStreamChunk *next = chunk->next;
+        aklv_cache_stream_chunk_free(chunk);
+        chunk = next;
+    }
+    writer->head = NULL;
+    writer->tail = NULL;
+    writer->queued_bytes = 0;
+}
+
+static void aklv_cache_stream_writer_fail_locked(AklvCacheStreamWriter *writer, const char *message) {
+    if (writer == NULL || writer->failed) {
+        return;
+    }
+    writer->failed = true;
+    snprintf(writer->error, sizeof(writer->error), "%s", message != NULL ? message : "cache stream writer failed");
+    pthread_cond_broadcast(&writer->cond);
+}
+
+static bool aklv_cache_stream_writer_failed(AklvCacheStreamWriter *writer) {
+    if (writer == NULL || !writer->mutex_initialized) {
+        return true;
+    }
+    pthread_mutex_lock(&writer->mutex);
+    bool failed = writer->failed || writer->aborting;
+    pthread_mutex_unlock(&writer->mutex);
+    return failed;
+}
+
+static void *aklv_cache_stream_writer_main(void *arg) {
+    AklvCacheStreamWriter *writer = (AklvCacheStreamWriter *)arg;
+    while (true) {
+        pthread_mutex_lock(&writer->mutex);
+        while (writer->head == NULL && !writer->done && !writer->failed && !writer->aborting) {
+            pthread_cond_wait(&writer->cond, &writer->mutex);
+        }
+        if (writer->failed || writer->aborting) {
+            aklv_cache_stream_writer_free_queue_locked(writer);
+            pthread_cond_broadcast(&writer->cond);
+            pthread_mutex_unlock(&writer->mutex);
+            return NULL;
+        }
+        if (writer->head == NULL && writer->done) {
+            pthread_mutex_unlock(&writer->mutex);
+            return NULL;
+        }
+        AklvCacheStreamChunk *chunk = writer->head;
+        writer->head = chunk->next;
+        if (writer->head == NULL) {
+            writer->tail = NULL;
+        }
+        writer->queued_bytes -= chunk->size;
+        pthread_cond_broadcast(&writer->cond);
+        pthread_mutex_unlock(&writer->mutex);
+
+        bool ok = aklv_write_all(writer->stream, chunk->data, chunk->size);
+        aklv_cache_stream_chunk_free(chunk);
+        if (!ok) {
+            pthread_mutex_lock(&writer->mutex);
+            aklv_cache_stream_writer_fail_locked(writer, "failed to write cache stream chunk");
+            aklv_cache_stream_writer_free_queue_locked(writer);
+            pthread_mutex_unlock(&writer->mutex);
+            return NULL;
+        }
+    }
+}
+
+static bool aklv_cache_stream_writer_add_stats_locked(AklvCacheStreamWriter *writer,
+                                                      const AklvCacheStreamStats *stats) {
+    if (stats->gram_count > UINT64_MAX - writer->stats.gram_count ||
+        stats->payload_bytes > UINT64_MAX - writer->stats.payload_bytes ||
+        stats->total_container_count > UINT64_MAX - writer->stats.total_container_count) {
+        aklv_cache_stream_writer_fail_locked(writer, "cache stream statistics overflow");
+        return false;
+    }
+    writer->stats.gram_count += stats->gram_count;
+    writer->stats.payload_bytes += stats->payload_bytes;
+    writer->stats.total_container_count += stats->total_container_count;
+    if (writer->stats.total_container_count > UINT32_MAX) {
+        aklv_cache_stream_writer_fail_locked(writer, "cache stream container count overflow");
+        return false;
+    }
+    return true;
+}
+
+static bool aklv_cache_stream_writer_enqueue(AklvCacheStreamWriter *writer,
+                                             unsigned char *data,
+                                             size_t size,
+                                             const AklvCacheStreamStats *stats) {
+    if (writer == NULL || data == NULL || size == 0) {
+        free(data);
+        return writer != NULL;
+    }
+    AklvCacheStreamChunk *chunk = malloc(sizeof(*chunk));
+    if (chunk == NULL) {
+        free(data);
+        pthread_mutex_lock(&writer->mutex);
+        aklv_cache_stream_writer_fail_locked(writer, "failed to allocate cache stream chunk");
+        pthread_mutex_unlock(&writer->mutex);
+        return false;
+    }
+    chunk->data = data;
+    chunk->size = size;
+    chunk->next = NULL;
+
+    uint64_t chunk_bytes = (uint64_t)size;
+    pthread_mutex_lock(&writer->mutex);
+    if (chunk_bytes > UINT64_MAX - writer->queued_bytes) {
+        aklv_cache_stream_writer_fail_locked(writer, "cache stream queue overflow");
+        pthread_mutex_unlock(&writer->mutex);
+        aklv_cache_stream_chunk_free(chunk);
+        return false;
+    }
+    uint64_t queue_limit = chunk_bytes > AKLV_CACHE_STREAM_QUEUE_MAX_BYTES
+        ? chunk_bytes
+        : AKLV_CACHE_STREAM_QUEUE_MAX_BYTES;
+    while (!writer->failed && !writer->aborting &&
+           writer->queued_bytes > 0 &&
+           writer->queued_bytes > queue_limit - chunk_bytes) {
+        pthread_cond_wait(&writer->cond, &writer->mutex);
+    }
+    if (writer->failed || writer->aborting) {
+        pthread_mutex_unlock(&writer->mutex);
+        aklv_cache_stream_chunk_free(chunk);
+        return false;
+    }
+    if (stats != NULL && !aklv_cache_stream_writer_add_stats_locked(writer, stats)) {
+        pthread_mutex_unlock(&writer->mutex);
+        aklv_cache_stream_chunk_free(chunk);
+        return false;
+    }
+    if (writer->tail == NULL) {
+        writer->head = chunk;
+        writer->tail = chunk;
+    } else {
+        writer->tail->next = chunk;
+        writer->tail = chunk;
+    }
+    writer->queued_bytes += chunk_bytes;
+    pthread_cond_signal(&writer->cond);
+    pthread_mutex_unlock(&writer->mutex);
+    return true;
+}
+
+static void aklv_cache_chunk_builder_destroy(AklvCacheChunkBuilder *builder) {
+    if (builder == NULL) {
+        return;
+    }
+    free(builder->data);
+    memset(builder, 0, sizeof(*builder));
+}
+
+static bool aklv_cache_chunk_builder_flush(AklvCacheChunkBuilder *builder) {
+    if (builder == NULL || builder->size == 0) {
+        return true;
+    }
+    unsigned char *data = builder->data;
+    size_t size = builder->size;
+    AklvCacheStreamStats stats = builder->stats;
+    builder->data = NULL;
+    builder->size = 0;
+    builder->capacity = 0;
+    memset(&builder->stats, 0, sizeof(builder->stats));
+    return aklv_cache_stream_writer_enqueue(builder->writer, data, size, &stats);
+}
+
+static bool aklv_cache_chunk_builder_reserve(AklvCacheChunkBuilder *builder, size_t needed) {
+    if (needed <= builder->capacity) {
+        return true;
+    }
+    size_t new_capacity = AKLV_CACHE_STREAM_CHUNK_BYTES;
+    while (new_capacity < needed) {
+        if (new_capacity > SIZE_MAX / 2) {
+            new_capacity = needed;
+            break;
+        }
+        new_capacity *= 2;
+    }
+    unsigned char *new_data = realloc(builder->data, new_capacity);
+    if (new_data == NULL) {
+        return false;
+    }
+    builder->data = new_data;
+    builder->capacity = new_capacity;
+    return true;
+}
+
+static bool aklv_cache_chunk_builder_append(AklvCacheChunkBuilder *builder,
+                                            const void *data,
+                                            size_t size) {
+    if (size == 0) {
+        return true;
+    }
+    if (builder->size > SIZE_MAX - size ||
+        !aklv_cache_chunk_builder_reserve(builder, builder->size + size)) {
+        return false;
+    }
+    memcpy(builder->data + builder->size, data, size);
+    builder->size += size;
+    return true;
+}
+
+static bool aklv_cache_posting_record_size(const AklvGramPosting *posting,
+                                           size_t *record_size_out,
+                                           AklvCacheStreamStats *stats_out) {
+    if (posting == NULL || !posting->used || posting->lines.count == 0 ||
+        posting->lines.count > UINT32_MAX) {
+        return false;
+    }
+    uint64_t record_size = sizeof(AklvIndexCachePostingHeader);
+    uint64_t payload_bytes = 0;
+    for (uint64_t c = 0; c < posting->lines.count; c++) {
+        const AklvRoaringContainer *container = &posting->lines.containers[c];
+        uint64_t payload = aklv_cache_container_payload_bytes(container);
+        if (payload > UINT64_MAX - payload_bytes ||
+            sizeof(AklvIndexCacheContainerHeader) > UINT64_MAX - record_size ||
+            payload > UINT64_MAX - record_size - sizeof(AklvIndexCacheContainerHeader)) {
+            return false;
+        }
+        payload_bytes += payload;
+        record_size += sizeof(AklvIndexCacheContainerHeader) + payload;
+    }
+    if (record_size > (uint64_t)SIZE_MAX) {
+        return false;
+    }
+    *record_size_out = (size_t)record_size;
+    stats_out->gram_count = 1;
+    stats_out->total_container_count = posting->lines.count;
+    stats_out->payload_bytes = payload_bytes;
+    return true;
+}
+
+static bool aklv_cache_chunk_builder_append_container_payload(AklvCacheChunkBuilder *builder,
+                                                              const AklvRoaringContainer *container) {
+    switch (container->type) {
+        case AKLV_ROARING_FULL:
+            return true;
+        case AKLV_ROARING_RUN:
+            return aklv_cache_chunk_builder_append(builder,
+                                                   container->runs,
+                                                   (size_t)container->run_count * sizeof(*container->runs));
+        case AKLV_ROARING_BITMAP:
+            return aklv_cache_chunk_builder_append(builder,
+                                                   container->bitmap,
+                                                   1024 * sizeof(*container->bitmap));
+        case AKLV_ROARING_ARRAY:
+        default:
+            return aklv_cache_chunk_builder_append(builder,
+                                                   container->array,
+                                                   (size_t)container->cardinality * sizeof(*container->array));
+    }
+}
+
+static bool aklv_cache_chunk_builder_append_posting(AklvCacheChunkBuilder *builder,
+                                                    const AklvGramPosting *posting) {
+    size_t record_size = 0;
+    AklvCacheStreamStats record_stats = {0};
+    if (!aklv_cache_posting_record_size(posting, &record_size, &record_stats)) {
+        return false;
+    }
+    if (builder->size > 0 &&
+        (record_size > SIZE_MAX - builder->size ||
+         builder->size + record_size > AKLV_CACHE_STREAM_CHUNK_BYTES) &&
+        !aklv_cache_chunk_builder_flush(builder)) {
+        return false;
+    }
+    if (!aklv_cache_chunk_builder_reserve(builder, builder->size + record_size)) {
+        return false;
+    }
+
+    AklvIndexCachePostingHeader posting_header;
+    memset(&posting_header, 0, sizeof(posting_header));
+    posting_header.gram = posting->gram;
+    posting_header.container_count = (uint32_t)posting->lines.count;
+    posting_header.cardinality = posting->lines.cardinality;
+    if (!aklv_cache_chunk_builder_append(builder, &posting_header, sizeof(posting_header))) {
+        return false;
+    }
+    for (uint64_t c = 0; c < posting->lines.count; c++) {
+        const AklvRoaringContainer *container = &posting->lines.containers[c];
+        AklvIndexCacheContainerHeader container_header;
+        memset(&container_header, 0, sizeof(container_header));
+        container_header.key = container->key;
+        container_header.cardinality =
+            container->type == AKLV_ROARING_FULL ? 65536 : container->cardinality;
+        container_header.type = (uint32_t)container->type;
+        container_header.payload_count = aklv_cache_container_payload_count(container);
+        if (!aklv_cache_chunk_builder_append(builder, &container_header, sizeof(container_header)) ||
+            !aklv_cache_chunk_builder_append_container_payload(builder, container)) {
+            return false;
+        }
+    }
+    builder->stats.gram_count += record_stats.gram_count;
+    builder->stats.total_container_count += record_stats.total_container_count;
+    builder->stats.payload_bytes += record_stats.payload_bytes;
+    if (builder->size >= AKLV_CACHE_STREAM_CHUNK_BYTES) {
+        return aklv_cache_chunk_builder_flush(builder);
+    }
+    return true;
+}
+
+static void aklv_cache_stream_emit_index(AklvCacheStreamWriter *writer, const AklvGramIndex *index) {
+    if (writer == NULL || index == NULL || index->count == 0 || aklv_cache_stream_writer_failed(writer)) {
+        return;
+    }
+    AklvCacheChunkBuilder builder = {0};
+    builder.writer = writer;
+    for (uint64_t i = 0; i < index->count; i++) {
+        if (aklv_cache_stream_writer_failed(writer)) {
+            break;
+        }
+        uint64_t slot = index->used_slots[i];
+        if (slot >= index->capacity) {
+            pthread_mutex_lock(&writer->mutex);
+            aklv_cache_stream_writer_fail_locked(writer, "invalid cache stream gram slot");
+            pthread_mutex_unlock(&writer->mutex);
+            break;
+        }
+        const AklvGramPosting *posting = &index->items[slot];
+        if (!posting->used || posting->lines.count == 0) {
+            continue;
+        }
+        if (!aklv_cache_chunk_builder_append_posting(&builder, posting)) {
+            pthread_mutex_lock(&writer->mutex);
+            aklv_cache_stream_writer_fail_locked(writer, "failed to serialize cache stream posting");
+            pthread_mutex_unlock(&writer->mutex);
+            break;
+        }
+    }
+    if (!aklv_cache_chunk_builder_flush(&builder)) {
+        pthread_mutex_lock(&writer->mutex);
+        aklv_cache_stream_writer_fail_locked(writer, "failed to enqueue cache stream chunk");
+        pthread_mutex_unlock(&writer->mutex);
+    }
+    aklv_cache_chunk_builder_destroy(&builder);
+}
+
+static void aklv_cache_stream_writer_dispose(AklvCacheStreamWriter *writer, bool unlink_tmp) {
+    if (writer == NULL) {
+        return;
+    }
+    if (writer->mutex_initialized) {
+        pthread_mutex_lock(&writer->mutex);
+        aklv_cache_stream_writer_free_queue_locked(writer);
+        pthread_mutex_unlock(&writer->mutex);
+    }
+    if (writer->stream != NULL) {
+        fclose(writer->stream);
+        writer->stream = NULL;
+    }
+    if (unlink_tmp && writer->tmp_path[0] != '\0') {
+        unlink(writer->tmp_path);
+    }
+    if (writer->cond_initialized) {
+        pthread_cond_destroy(&writer->cond);
+    }
+    if (writer->mutex_initialized) {
+        pthread_mutex_destroy(&writer->mutex);
+    }
+    free(writer->stream_buffer);
+    free(writer->cache_path);
+    memset(writer, 0, sizeof(*writer));
+}
+
+static int aklv_cache_stream_writer_prepare(AklvCacheStreamWriter *writer,
+                                            const char *path,
+                                            const AklvLineIndex *index,
+                                            char *error,
+                                            size_t error_cap) {
+    memset(writer, 0, sizeof(*writer));
+    if (path == NULL || index == NULL || index->count == 0) {
+        return 1;
+    }
+    if (!aklv_cache_dir_ensure(error, error_cap)) {
+        return -1;
+    }
+    if (!aklv_index_cache_hash_path(path, writer->hash)) {
+        aklv_set_error(error, error_cap, "failed to initialize index cache metadata");
+        return -1;
+    }
+    AklvCacheFileIdentity identity;
+    memset(&identity, 0, sizeof(identity));
+    if (!aklv_file_stat_identity(path, &identity.file_size, &identity.mtime_sec, &identity.mtime_nsec)) {
+        aklv_set_error(error, error_cap, "stat file failed before cache store: %s: %s", path, strerror(errno));
+        return -1;
+    }
+    memset(&writer->header, 0, sizeof(writer->header));
+    memcpy(writer->header.magic, AKLV_INDEX_CACHE_MAGIC, sizeof(writer->header.magic));
+    writer->header.version = AKLV_INDEX_CACHE_VERSION;
+    writer->header.file_size = identity.file_size;
+    writer->header.file_mtime_sec = identity.mtime_sec;
+    writer->header.file_mtime_nsec = identity.mtime_nsec;
+    writer->header.line_count = index->count;
+    writer->header.first_line = index->count == 0 ? 0 : 1;
+    writer->header.last_line = index->count;
+    writer->header.offset_count = index->count;
+    writer->header.gram_size = AKLV_ASCII_GRAM_MAX_SIZE;
+
+    writer->cache_path = aklv_index_cache_path_for(writer->hash);
+    if (writer->cache_path == NULL) {
+        aklv_set_error(error, error_cap, "failed to allocate cache path");
+        return -1;
+    }
+    uint64_t tmp_id = atomic_fetch_add_explicit(&g_aklv_cache_tmp_counter, 1, memory_order_relaxed);
+    int tmp_len = snprintf(writer->tmp_path,
+                           sizeof(writer->tmp_path),
+                           "%s.%ld.%" PRIu64 ".tmp",
+                           writer->cache_path,
+                           (long)getpid(),
+                           tmp_id);
+    if (tmp_len < 0 || (size_t)tmp_len >= sizeof(writer->tmp_path)) {
+        aklv_set_error(error, error_cap, "cache temp path too long");
+        aklv_cache_stream_writer_dispose(writer, false);
+        return -1;
+    }
+
+    if (pthread_mutex_init(&writer->mutex, NULL) != 0) {
+        aklv_set_error(error, error_cap, "failed to initialize cache stream lock");
+        aklv_cache_stream_writer_dispose(writer, false);
+        return -1;
+    }
+    writer->mutex_initialized = true;
+    if (pthread_cond_init(&writer->cond, NULL) != 0) {
+        aklv_set_error(error, error_cap, "failed to initialize cache stream lock");
+        aklv_cache_stream_writer_dispose(writer, false);
+        return -1;
+    }
+    writer->cond_initialized = true;
+
+    writer->stream = fopen(writer->tmp_path, "wb");
+    if (writer->stream == NULL) {
+        aklv_set_error(error, error_cap, "open cache file failed: %s: %s", writer->tmp_path, strerror(errno));
+        aklv_cache_stream_writer_dispose(writer, false);
+        return -1;
+    }
+    writer->stream_buffer = malloc(AKLV_CACHE_STREAM_BUFFER_BYTES);
+    if (writer->stream_buffer != NULL) {
+        setvbuf(writer->stream, (char *)writer->stream_buffer, _IOFBF, AKLV_CACHE_STREAM_BUFFER_BYTES);
+    }
+    uint64_t *offset_values = malloc((size_t)AKLV_CACHE_OFFSET_CONVERT_BATCH * sizeof(*offset_values));
+    if (offset_values == NULL) {
+        aklv_set_error(error, error_cap, "failed to allocate cache offset write buffer");
+        aklv_cache_stream_writer_dispose(writer, true);
+        return -1;
+    }
+    bool ok = aklv_write_all(writer->stream, &writer->header, sizeof(writer->header)) &&
+              aklv_cache_write_padding(writer->stream, AKLV_INDEX_CACHE_HEADER_SIZE - sizeof(writer->header)) &&
+              aklv_cache_write_offset_range(writer->stream, index, 1, index->count, offset_values);
+    free(offset_values);
+    if (!ok) {
+        aklv_set_error(error, error_cap, "failed to write cache file offsets");
+        aklv_cache_stream_writer_dispose(writer, true);
+        return -1;
+    }
+    int pthread_rc = pthread_create(&writer->thread, NULL, aklv_cache_stream_writer_main, writer);
+    if (pthread_rc != 0) {
+        aklv_set_error(error,
+                       error_cap,
+                       "pthread_create failed while starting cache stream writer: %s",
+                       strerror(pthread_rc));
+        aklv_cache_stream_writer_dispose(writer, true);
+        return -1;
+    }
+    writer->thread_created = true;
+    return 0;
+}
+
+static void aklv_cache_stream_writer_abort(AklvCacheStreamWriter *writer) {
+    if (writer == NULL || writer->stream == NULL) {
+        return;
+    }
+    if (writer->thread_created) {
+        pthread_mutex_lock(&writer->mutex);
+        writer->aborting = true;
+        writer->done = true;
+        pthread_cond_broadcast(&writer->cond);
+        pthread_mutex_unlock(&writer->mutex);
+        pthread_join(writer->thread, NULL);
+        writer->thread_created = false;
+    }
+    aklv_cache_stream_writer_dispose(writer, true);
+}
+
+static int aklv_index_cache_finish_direct(AklvIndexCache *cache,
+                                          AklvCacheStreamWriter *writer,
+                                          AklvGramIndex *gram_index,
+                                          char *error,
+                                          size_t error_cap) {
+    if (cache == NULL || writer == NULL || writer->stream == NULL) {
+        return -1;
+    }
+    if (writer->thread_created) {
+        pthread_mutex_lock(&writer->mutex);
+        writer->done = true;
+        pthread_cond_broadcast(&writer->cond);
+        pthread_mutex_unlock(&writer->mutex);
+        pthread_join(writer->thread, NULL);
+        writer->thread_created = false;
+    }
+
+    bool failed = false;
+    pthread_mutex_lock(&writer->mutex);
+    failed = writer->failed || writer->aborting;
+    if (failed && writer->error[0] != '\0') {
+        aklv_set_error(error, error_cap, "%s", writer->error);
+    }
+    pthread_mutex_unlock(&writer->mutex);
+    if (failed || writer->stats.total_container_count > UINT32_MAX) {
+        if (!failed) {
+            aklv_set_error(error, error_cap, "cache stream statistics overflow");
+        }
+        aklv_cache_stream_writer_dispose(writer, true);
+        return -1;
+    }
+
+    writer->header.gram_count = writer->stats.gram_count;
+    writer->header.payload_bytes = writer->stats.payload_bytes;
+    writer->header.total_container_count = (uint32_t)writer->stats.total_container_count;
+    bool ok = fseek(writer->stream, 0, SEEK_SET) == 0 &&
+              aklv_write_all(writer->stream, &writer->header, sizeof(writer->header)) &&
+              fseek(writer->stream, 0, SEEK_END) == 0 &&
+              fflush(writer->stream) == 0;
+    if (fclose(writer->stream) != 0) {
+        ok = false;
+    }
+    writer->stream = NULL;
+    if (!ok || rename(writer->tmp_path, writer->cache_path) != 0) {
+        aklv_set_error(error, error_cap, "failed to write cache file: %s", writer->cache_path);
+        aklv_cache_stream_writer_dispose(writer, true);
+        return -1;
+    }
+
+    aklv_index_cache_destroy(cache);
+    memset(cache, 0, sizeof(*cache));
+    if (pthread_mutex_init(&cache->mutex, NULL) != 0) {
+        aklv_set_error(error, error_cap, "failed to initialize index cache lock");
+        aklv_cache_stream_writer_dispose(writer, false);
+        return -1;
+    }
+    cache->mutex_initialized = true;
+    if (pthread_cond_init(&cache->cond, NULL) != 0) {
+        aklv_set_error(error, error_cap, "failed to initialize index cache lock");
+        aklv_index_cache_destroy(cache);
+        aklv_cache_stream_writer_dispose(writer, false);
+        return -1;
+    }
+    cache->cond_initialized = true;
+    cache->dir = aklv_strdup(AKLV_INDEX_CACHE_DIR);
+    cache->path = aklv_strdup(writer->cache_path);
+    if (cache->dir == NULL || cache->path == NULL) {
+        aklv_set_error(error, error_cap, "failed to remember cache file");
+        aklv_index_cache_destroy(cache);
+        aklv_cache_stream_writer_dispose(writer, false);
+        return -1;
+    }
+    snprintf(cache->hash, sizeof(cache->hash), "%s", writer->hash);
+    cache->file_size = writer->header.file_size;
+    cache->file_mtime_sec = writer->header.file_mtime_sec;
+    cache->file_mtime_nsec = writer->header.file_mtime_nsec;
+    cache->line_count = writer->header.line_count;
+    cache->offset_count = writer->header.offset_count;
+    cache->gram_count = writer->header.gram_count;
+    cache->total_container_count = writer->header.total_container_count;
+    cache->payload_bytes = writer->header.payload_bytes;
+    if (gram_index != NULL) {
+        cache->gram_index = *gram_index;
+        memset(gram_index, 0, sizeof(*gram_index));
+        cache->gram_index_loaded = true;
+    }
+    cache->available = true;
+    aklv_cache_stream_writer_dispose(writer, false);
+    return 0;
 }
 
 static int aklv_index_cache_write_file(const char *path,
@@ -3096,11 +3750,12 @@ static void *aklv_gram_build_worker_main(void *arg) {
     return NULL;
 }
 
-int aklv_build_line_index(const AklvMappedFile *mapped,
-                          AklvLineIndex *index,
-                          const atomic_bool *cancel,
-                          char *error,
-                          size_t error_cap) {
+static int aklv_build_line_index_internal(const char *cache_source_path,
+                                          const AklvMappedFile *mapped,
+                                          AklvLineIndex *index,
+                                          const atomic_bool *cancel,
+                                          char *error,
+                                          size_t error_cap) {
     memset(index, 0, sizeof(*index));
     if (mapped->size == 0) {
         return 0;
@@ -3144,6 +3799,9 @@ int aklv_build_line_index(const AklvMappedFile *mapped,
             return -1;
         }
     }
+
+    AklvCacheStreamWriter cache_writer = {0};
+    AklvCacheStreamWriter *cache_writer_ptr = NULL;
 
     atomic_bool build_cancel;
     atomic_init(&build_cancel, false);
@@ -3211,11 +3869,22 @@ int aklv_build_line_index(const AklvMappedFile *mapped,
             }
         }
     }
+    if (rc == 0 && cache_source_path != NULL) {
+        char cache_error[256] = {0};
+        if (aklv_cache_stream_writer_prepare(&cache_writer,
+                                             cache_source_path,
+                                             index,
+                                             cache_error,
+                                             sizeof(cache_error)) == 0) {
+            cache_writer_ptr = &cache_writer;
+        }
+    }
     if (rc == 0) {
         rc = aklv_merge_worker_indexes_by_partition(index,
                                                     tasks,
                                                     thread_count,
                                                     thread_count,
+                                                    cache_writer_ptr,
                                                     cancel,
                                                     error,
                                                     error_cap);
@@ -3233,11 +3902,42 @@ int aklv_build_line_index(const AklvMappedFile *mapped,
     }
     free(threads);
     free(tasks);
+    if (cache_writer_ptr != NULL) {
+        if (rc == 0) {
+            char cache_error[256] = {0};
+            if (aklv_index_cache_finish_direct(&index->cache,
+                                               cache_writer_ptr,
+                                               &index->gram_index,
+                                               cache_error,
+                                               sizeof(cache_error)) != 0) {
+                (void)cache_error;
+            }
+        } else {
+            aklv_cache_stream_writer_abort(cache_writer_ptr);
+        }
+    }
     if (rc != 0) {
         aklv_line_index_destroy(index);
         return rc;
     }
     return 0;
+}
+
+int aklv_build_line_index(const AklvMappedFile *mapped,
+                          AklvLineIndex *index,
+                          const atomic_bool *cancel,
+                          char *error,
+                          size_t error_cap) {
+    return aklv_build_line_index_internal(NULL, mapped, index, cancel, error, error_cap);
+}
+
+static int aklv_build_line_index_with_direct_cache(const char *path,
+                                                   const AklvMappedFile *mapped,
+                                                   AklvLineIndex *index,
+                                                   const atomic_bool *cancel,
+                                                   char *error,
+                                                   size_t error_cap) {
+    return aklv_build_line_index_internal(path, mapped, index, cancel, error, error_cap);
 }
 
 size_t aklv_line_index_offset(const AklvLineIndex *index, uint64_t line_no) {
@@ -3333,16 +4033,20 @@ int aklv_file_open_path(const char *path,
 
     int rc = aklv_index_cache_try_load(path, &file->mapped, &file->index, error, error_cap);
     if (rc != 0) {
-        rc = aklv_build_line_index(&file->mapped, &file->index, cancel, error, error_cap);
+        rc = aklv_build_line_index_with_direct_cache(path, &file->mapped, &file->index, cancel, error, error_cap);
         if (rc != 0) {
             aklv_file_release(file);
             return rc;
         }
-        if ((uint64_t)file->mapped.size > AKLV_SYNC_CACHE_STORE_MAX_FILE_BYTES) {
-            aklv_index_cache_store_async(file);
-        } else {
+        if (!file->index.cache.available) {
             char cache_error[256] = {0};
-            if (aklv_index_cache_store(path, &file->mapped, &file->index, cache_error, sizeof(cache_error)) != 0) {
+            if ((uint64_t)file->mapped.size > AKLV_SYNC_CACHE_STORE_MAX_FILE_BYTES) {
+                aklv_index_cache_store_async(file);
+            } else if (aklv_index_cache_store(path,
+                                              &file->mapped,
+                                              &file->index,
+                                              cache_error,
+                                              sizeof(cache_error)) != 0) {
                 (void)cache_error;
             }
         }
