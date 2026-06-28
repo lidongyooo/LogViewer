@@ -41,6 +41,23 @@
 #ifndef AKLV_WORKER_GRAM_RESERVE_MAX
 #define AKLV_WORKER_GRAM_RESERVE_MAX UINT64_C(131072)
 #endif
+#ifndef AKLV_GRAM_PAIR_FLUSH_COUNT
+#define AKLV_GRAM_PAIR_FLUSH_COUNT UINT64_C(1048576)
+#endif
+#ifndef AKLV_GRAM_PARTITION_FLUSH_COUNT
+#define AKLV_GRAM_PARTITION_FLUSH_COUNT UINT64_C(65536)
+#endif
+#define AKLV_GRAM_PAIR_LINE_BITS 43
+#define AKLV_GRAM_PAIR_LINE_MASK ((UINT64_C(1) << AKLV_GRAM_PAIR_LINE_BITS) - 1U)
+#define AKLV_GRAM_DENSE_BITS 21
+#define AKLV_GRAM_PARTITION_BITS 8
+#define AKLV_GRAM_PARTITION_COUNT (1U << AKLV_GRAM_PARTITION_BITS)
+#define AKLV_GRAM_PARTITION_BUCKET_BITS (AKLV_GRAM_DENSE_BITS - AKLV_GRAM_PARTITION_BITS)
+#define AKLV_GRAM_PARTITION_BUCKET_COUNT (1U << AKLV_GRAM_PARTITION_BUCKET_BITS)
+#define AKLV_GRAM_PARTITION_BUCKET_MASK (AKLV_GRAM_PARTITION_BUCKET_COUNT - 1U)
+#ifndef AKLV_INDEX_THREAD_MAX
+#define AKLV_INDEX_THREAD_MAX 16
+#endif
 #ifndef AKLV_SYNC_CACHE_STORE_MAX_FILE_BYTES
 #define AKLV_SYNC_CACHE_STORE_MAX_FILE_BYTES UINT64_C(134217728)
 #endif
@@ -54,6 +71,23 @@ typedef struct {
     uint64_t used_count;
     uint64_t used_capacity;
 } AklvGramScratch;
+
+typedef struct {
+    uint64_t *keys;
+    uint64_t count;
+    uint64_t capacity;
+} AklvGramPairBuffer;
+
+typedef struct {
+    AklvGramPairBuffer buffers[AKLV_GRAM_PARTITION_COUNT];
+    uint64_t total_count;
+    uint64_t *sort_keys;
+    uint64_t sort_capacity;
+    uint64_t *sort_counts;
+    uint64_t *sort_offsets;
+    uint32_t flush_partition;
+    bool has_flush_partition;
+} AklvGramPairPartitions;
 
 typedef struct {
     char magic[8];
@@ -99,6 +133,7 @@ typedef struct {
 
 static uint32_t aklv_gram_dense_index(uint32_t gram);
 static uint32_t aklv_lower_bound_u16(const uint16_t *items, uint32_t count, uint16_t value);
+static uint32_t aklv_effective_prefix_skip(AklvLineView line);
 
 static void aklv_set_error(char *error, size_t error_cap, const char *fmt, ...) {
     if (error == NULL || error_cap == 0) {
@@ -1068,12 +1103,204 @@ static AklvGramPosting *aklv_gram_index_slot(AklvGramIndex *index, uint32_t gram
     return &index->items[slot];
 }
 
-static bool aklv_gram_index_add(AklvGramIndex *index, uint32_t gram, uint64_t line_no) {
-    AklvGramPosting *posting = aklv_gram_index_slot(index, gram, true);
-    if (posting == NULL) {
+static void aklv_gram_pair_buffer_destroy(AklvGramPairBuffer *buffer) {
+    if (buffer == NULL) {
+        return;
+    }
+    free(buffer->keys);
+    memset(buffer, 0, sizeof(*buffer));
+}
+
+static bool aklv_gram_pair_buffer_reserve(AklvGramPairBuffer *buffer, uint64_t needed) {
+    if (needed <= buffer->capacity) {
+        return true;
+    }
+    uint64_t new_capacity = buffer->capacity == 0 ? 8192 : buffer->capacity;
+    while (new_capacity < needed) {
+        if (new_capacity > UINT64_MAX / 2) {
+            return false;
+        }
+        new_capacity *= 2;
+    }
+    if (new_capacity > (uint64_t)(SIZE_MAX / sizeof(*buffer->keys))) {
         return false;
     }
-    return aklv_roaring_add(&posting->lines, line_no);
+    uint64_t *new_keys = realloc(buffer->keys, (size_t)new_capacity * sizeof(*new_keys));
+    if (new_keys == NULL) {
+        return false;
+    }
+    buffer->keys = new_keys;
+    buffer->capacity = new_capacity;
+    return true;
+}
+
+static uint64_t aklv_gram_pair_pack(uint32_t gram, uint64_t line_no) {
+    uint64_t dense = aklv_gram_dense_index(gram);
+    return (dense << AKLV_GRAM_PAIR_LINE_BITS) | (line_no & AKLV_GRAM_PAIR_LINE_MASK);
+}
+
+static uint32_t aklv_gram_from_dense(uint32_t dense) {
+    return (AKLV_ASCII_GRAM_MAX_SIZE << 24) |
+           (((dense >> 14) & 0x7fU) << 16) |
+           (((dense >> 7) & 0x7fU) << 8) |
+           (dense & 0x7fU);
+}
+
+static uint32_t aklv_gram_pair_dense(uint64_t key) {
+    return (uint32_t)(key >> AKLV_GRAM_PAIR_LINE_BITS);
+}
+
+static uint64_t aklv_gram_pair_line(uint64_t key) {
+    return key & AKLV_GRAM_PAIR_LINE_MASK;
+}
+
+static void aklv_gram_pair_partitions_destroy(AklvGramPairPartitions *partitions) {
+    if (partitions == NULL) {
+        return;
+    }
+    for (uint32_t i = 0; i < AKLV_GRAM_PARTITION_COUNT; i++) {
+        aklv_gram_pair_buffer_destroy(&partitions->buffers[i]);
+    }
+    free(partitions->sort_keys);
+    free(partitions->sort_counts);
+    free(partitions->sort_offsets);
+    memset(partitions, 0, sizeof(*partitions));
+}
+
+static bool aklv_gram_pair_partitions_ensure_sort(AklvGramPairPartitions *partitions,
+                                                  uint64_t needed) {
+    if (partitions->sort_counts == NULL) {
+        partitions->sort_counts = calloc(AKLV_GRAM_PARTITION_BUCKET_COUNT,
+                                         sizeof(*partitions->sort_counts));
+        partitions->sort_offsets = malloc(AKLV_GRAM_PARTITION_BUCKET_COUNT *
+                                          sizeof(*partitions->sort_offsets));
+        if (partitions->sort_counts == NULL || partitions->sort_offsets == NULL) {
+            return false;
+        }
+    }
+    if (needed <= partitions->sort_capacity) {
+        return true;
+    }
+    if (needed > (uint64_t)(SIZE_MAX / sizeof(*partitions->sort_keys))) {
+        return false;
+    }
+    uint64_t *new_keys = realloc(partitions->sort_keys, (size_t)needed * sizeof(*new_keys));
+    if (new_keys == NULL) {
+        return false;
+    }
+    partitions->sort_keys = new_keys;
+    partitions->sort_capacity = needed;
+    return true;
+}
+
+static bool aklv_gram_pair_partition_flush(AklvGramPairPartitions *partitions,
+                                           uint32_t partition_id,
+                                           AklvGramIndex *index) {
+    if (partitions == NULL || partition_id >= AKLV_GRAM_PARTITION_COUNT) {
+        return false;
+    }
+    AklvGramPairBuffer *buffer = &partitions->buffers[partition_id];
+    if (buffer->count == 0) {
+        return true;
+    }
+    if (!aklv_gram_pair_partitions_ensure_sort(partitions, buffer->count)) {
+        return false;
+    }
+    memset(partitions->sort_counts,
+           0,
+           AKLV_GRAM_PARTITION_BUCKET_COUNT * sizeof(*partitions->sort_counts));
+    for (uint64_t i = 0; i < buffer->count; i++) {
+        uint32_t bucket = aklv_gram_pair_dense(buffer->keys[i]) & AKLV_GRAM_PARTITION_BUCKET_MASK;
+        partitions->sort_counts[bucket]++;
+    }
+    uint64_t offset = 0;
+    for (uint32_t bucket = 0; bucket < AKLV_GRAM_PARTITION_BUCKET_COUNT; bucket++) {
+        partitions->sort_offsets[bucket] = offset;
+        offset += partitions->sort_counts[bucket];
+        partitions->sort_counts[bucket] = partitions->sort_offsets[bucket];
+    }
+    for (uint64_t i = 0; i < buffer->count; i++) {
+        uint64_t key = buffer->keys[i];
+        uint32_t bucket = aklv_gram_pair_dense(key) & AKLV_GRAM_PARTITION_BUCKET_MASK;
+        partitions->sort_keys[partitions->sort_counts[bucket]++] = key;
+    }
+    uint64_t i = 0;
+    while (i < buffer->count) {
+        uint32_t dense = aklv_gram_pair_dense(partitions->sort_keys[i]);
+        uint32_t gram = aklv_gram_from_dense(dense);
+        AklvGramPosting *posting = aklv_gram_index_slot(index, gram, true);
+        if (posting == NULL) {
+            return false;
+        }
+        uint64_t last_line = 0;
+        while (i < buffer->count && aklv_gram_pair_dense(partitions->sort_keys[i]) == dense) {
+            uint64_t line_no = aklv_gram_pair_line(partitions->sort_keys[i]);
+            if (line_no != last_line) {
+                if (!aklv_roaring_add(&posting->lines, line_no)) {
+                    return false;
+                }
+                last_line = line_no;
+            }
+            i++;
+        }
+    }
+    partitions->total_count -= buffer->count;
+    buffer->count = 0;
+    return true;
+}
+
+static bool aklv_gram_pair_partitions_append(AklvGramPairPartitions *partitions,
+                                             uint32_t gram,
+                                             uint64_t line_no,
+                                             AklvGramIndex *partition_indexes) {
+    uint64_t key = aklv_gram_pair_pack(gram, line_no);
+    uint32_t partition_id = aklv_gram_pair_dense(key) >> AKLV_GRAM_PARTITION_BUCKET_BITS;
+    AklvGramPairBuffer *buffer = &partitions->buffers[partition_id];
+    if (!aklv_gram_pair_buffer_reserve(buffer, buffer->count + 1)) {
+        return false;
+    }
+    buffer->keys[buffer->count++] = key;
+    partitions->total_count++;
+    if (buffer->count >= AKLV_GRAM_PARTITION_FLUSH_COUNT) {
+        return aklv_gram_pair_partition_flush(partitions,
+                                              partition_id,
+                                              &partition_indexes[partition_id]);
+    }
+    return true;
+}
+
+static bool aklv_gram_pair_partitions_flush_one(AklvGramPairPartitions *partitions,
+                                                AklvGramIndex *partition_indexes) {
+    if (partitions == NULL || partitions->total_count == 0) {
+        return true;
+    }
+    uint32_t start = partitions->has_flush_partition ? partitions->flush_partition : 0;
+    for (uint32_t step = 0; step < AKLV_GRAM_PARTITION_COUNT; step++) {
+        uint32_t partition_id = (start + step) & (AKLV_GRAM_PARTITION_COUNT - 1U);
+        if (partitions->buffers[partition_id].count != 0) {
+            partitions->flush_partition = (partition_id + 1U) & (AKLV_GRAM_PARTITION_COUNT - 1U);
+            partitions->has_flush_partition = true;
+            return aklv_gram_pair_partition_flush(partitions,
+                                                  partition_id,
+                                                  &partition_indexes[partition_id]);
+        }
+    }
+    return true;
+}
+
+static bool aklv_gram_pair_partitions_flush_all(AklvGramPairPartitions *partitions,
+                                                AklvGramIndex *partition_indexes) {
+    if (partitions == NULL) {
+        return true;
+    }
+    for (uint32_t partition_id = 0; partition_id < AKLV_GRAM_PARTITION_COUNT; partition_id++) {
+        if (!aklv_gram_pair_partition_flush(partitions,
+                                            partition_id,
+                                            &partition_indexes[partition_id])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void aklv_gram_index_destroy(AklvGramIndex *index) {
@@ -1253,32 +1480,61 @@ void aklv_line_index_destroy(AklvLineIndex *index) {
 
 typedef struct {
     const AklvMappedFile *mapped;
+    size_t start;
+    size_t end;
+    const atomic_bool *cancel;
+    atomic_bool *build_cancel;
+    AklvLineIndex line_index;
+    int status;
+    char error[256];
+} AklvLineBuildTask;
+
+typedef struct {
+    const AklvMappedFile *mapped;
     const AklvLineIndex *line_index;
     uint64_t first_line;
     uint64_t last_line;
     const atomic_bool *cancel;
     atomic_bool *build_cancel;
-    AklvGramIndex gram_index;
+    AklvGramIndex *partition_indexes;
     int status;
     char error[256];
 } AklvGramBuildTask;
 
-static bool aklv_gram_build_union_count(const AklvGramBuildTask *tasks,
-                                        uint32_t task_count,
-                                        uint64_t *count_out) {
+typedef struct {
+    AklvGramBuildTask *workers;
+    uint32_t worker_count;
+    uint32_t first_partition;
+    uint32_t last_partition;
+    AklvGramIndex gram_index;
+    uint64_t gram_count;
+    int status;
+    char error[256];
+} AklvPartitionMergeTask;
+
+static bool aklv_gram_build_partition_union_count(const AklvGramBuildTask *tasks,
+                                                  uint32_t task_count,
+                                                  uint32_t partition_id,
+                                                  uint64_t *count_out) {
     *count_out = 0;
-    uint64_t *seen_words = calloc((size_t)AKLV_ASCII_GRAM_KEY_SPACE_WORDS, sizeof(*seen_words));
+    uint64_t *seen_words = calloc(AKLV_GRAM_PARTITION_BUCKET_COUNT / 64,
+                                  sizeof(*seen_words));
     if (seen_words == NULL) {
         return false;
     }
     uint64_t count = 0;
+    uint32_t partition_base = partition_id << AKLV_GRAM_PARTITION_BUCKET_BITS;
     for (uint32_t task_i = 0; task_i < task_count; task_i++) {
-        const AklvGramIndex *index = &tasks[task_i].gram_index;
+        if (tasks[task_i].partition_indexes == NULL) {
+            continue;
+        }
+        const AklvGramIndex *index = &tasks[task_i].partition_indexes[partition_id];
         for (uint64_t i = 0; i < index->count; i++) {
             uint64_t slot = index->used_slots[i];
             uint32_t dense = aklv_gram_dense_index(index->items[slot].gram);
-            uint32_t word_index = dense >> 6;
-            uint64_t mask = UINT64_C(1) << (dense & 63U);
+            uint32_t local = dense - partition_base;
+            uint32_t word_index = local >> 6;
+            uint64_t mask = UINT64_C(1) << (local & 63U);
             if ((seen_words[word_index] & mask) == 0) {
                 seen_words[word_index] |= mask;
                 count++;
@@ -1290,6 +1546,155 @@ static bool aklv_gram_build_union_count(const AklvGramBuildTask *tasks,
     return true;
 }
 
+static void *aklv_partition_merge_worker_main(void *arg) {
+    AklvPartitionMergeTask *task = (AklvPartitionMergeTask *)arg;
+    uint64_t merged_count = 0;
+    for (uint32_t partition_id = task->first_partition;
+         partition_id < task->last_partition;
+         partition_id++) {
+        uint64_t partition_count = 0;
+        if (!aklv_gram_build_partition_union_count(task->workers,
+                                                   task->worker_count,
+                                                   partition_id,
+                                                   &partition_count)) {
+            task->status = -1;
+            snprintf(task->error, sizeof(task->error), "%s", "failed to count partition index");
+            return NULL;
+        }
+        if (partition_count > UINT64_MAX - merged_count) {
+            task->status = -1;
+            snprintf(task->error, sizeof(task->error), "%s", "partition index too large");
+            return NULL;
+        }
+        merged_count += partition_count;
+    }
+    task->gram_count = merged_count;
+    if (!aklv_gram_index_reserve_for_count(&task->gram_index, merged_count)) {
+        task->status = -1;
+        snprintf(task->error, sizeof(task->error), "%s", "failed to reserve partition index");
+        return NULL;
+    }
+    for (uint32_t partition_id = task->first_partition;
+         partition_id < task->last_partition;
+         partition_id++) {
+        for (uint32_t worker_i = 0; worker_i < task->worker_count; worker_i++) {
+            if (task->workers[worker_i].partition_indexes == NULL) {
+                continue;
+            }
+            if (!aklv_gram_index_merge_move(&task->gram_index,
+                                            &task->workers[worker_i].partition_indexes[partition_id])) {
+                task->status = -1;
+                snprintf(task->error, sizeof(task->error), "%s", "failed to merge partition index");
+                return NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
+static int aklv_merge_worker_indexes_by_partition(AklvLineIndex *index,
+                                                  AklvGramBuildTask *workers,
+                                                  uint32_t worker_count,
+                                                  uint32_t thread_count,
+                                                  const atomic_bool *cancel,
+                                                  char *error,
+                                                  size_t error_cap) {
+    if (thread_count > AKLV_GRAM_PARTITION_COUNT) {
+        thread_count = AKLV_GRAM_PARTITION_COUNT;
+    }
+    if (thread_count == 0) {
+        thread_count = 1;
+    }
+    AklvPartitionMergeTask *tasks = calloc(thread_count, sizeof(*tasks));
+    pthread_t *threads = NULL;
+    if (thread_count > 1) {
+        threads = calloc(thread_count, sizeof(*threads));
+    }
+    if (tasks == NULL || (thread_count > 1 && threads == NULL)) {
+        free(tasks);
+        free(threads);
+        aklv_set_error(error, error_cap, "calloc failed while allocating partition merge tasks");
+        return -1;
+    }
+
+    uint32_t created_threads = 0;
+    int rc = 0;
+    uint32_t base_partitions = AKLV_GRAM_PARTITION_COUNT / thread_count;
+    uint32_t extra_partitions = AKLV_GRAM_PARTITION_COUNT % thread_count;
+    uint32_t first_partition = 0;
+    for (uint32_t i = 0; i < thread_count; i++) {
+        uint32_t count = base_partitions + (i < extra_partitions ? 1U : 0U);
+        tasks[i].workers = workers;
+        tasks[i].worker_count = worker_count;
+        tasks[i].first_partition = first_partition;
+        tasks[i].last_partition = first_partition + count;
+        first_partition = tasks[i].last_partition;
+        if (thread_count == 1) {
+            aklv_partition_merge_worker_main(&tasks[i]);
+        } else {
+            int pthread_rc = pthread_create(&threads[i],
+                                            NULL,
+                                            aklv_partition_merge_worker_main,
+                                            &tasks[i]);
+            if (pthread_rc != 0) {
+                aklv_set_error(error,
+                               error_cap,
+                               "pthread_create failed while merging index: %s",
+                               strerror(pthread_rc));
+                rc = -1;
+                break;
+            }
+            created_threads++;
+        }
+    }
+    for (uint32_t i = 0; i < created_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    if (rc == 0) {
+        uint64_t merged_count = 0;
+        for (uint32_t i = 0; i < thread_count; i++) {
+            if (tasks[i].status != 0) {
+                rc = tasks[i].status;
+                aklv_set_error(error,
+                               error_cap,
+                               "%s",
+                               tasks[i].error[0] != '\0' ? tasks[i].error : "partition merge failed");
+                break;
+            }
+            if (tasks[i].gram_count > UINT64_MAX - merged_count) {
+                aklv_set_error(error, error_cap, "merged index too large");
+                rc = -1;
+                break;
+            }
+            merged_count += tasks[i].gram_count;
+        }
+        if (rc == 0 && !aklv_gram_index_reserve_for_count(&index->gram_index, merged_count)) {
+            aklv_set_error(error, error_cap, "failed to reserve merged index table");
+            rc = -1;
+        }
+    }
+    if (rc == 0) {
+        for (uint32_t i = 0; i < thread_count; i++) {
+            if (cancel != NULL && atomic_load_explicit(cancel, memory_order_relaxed)) {
+                aklv_set_error(error, error_cap, "index build cancelled");
+                rc = -2;
+                break;
+            }
+            if (!aklv_gram_index_merge_move(&index->gram_index, &tasks[i].gram_index)) {
+                aklv_set_error(error, error_cap, "failed to assemble merged index");
+                rc = -1;
+                break;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < thread_count; i++) {
+        aklv_gram_index_destroy(&tasks[i].gram_index);
+    }
+    free(threads);
+    free(tasks);
+    return rc;
+}
+
 static uint32_t aklv_default_index_thread_count(void) {
     long cores = sysconf(_SC_NPROCESSORS_ONLN);
     if (cores < 1) {
@@ -1299,10 +1704,23 @@ static uint32_t aklv_default_index_thread_count(void) {
     if (threads < 1) {
         threads = 1;
     }
-    if (threads > 8) {
-        threads = 8;
+    if (threads > AKLV_INDEX_THREAD_MAX) {
+        threads = AKLV_INDEX_THREAD_MAX;
     }
     return (uint32_t)threads;
+}
+
+static size_t aklv_line_build_align_end(const AklvMappedFile *mapped, size_t end) {
+    if (mapped == NULL || mapped->size == 0 || end >= mapped->size) {
+        return mapped == NULL ? 0 : mapped->size;
+    }
+    const unsigned char *data = mapped->data;
+    const unsigned char *newline = aklv_find_byte_simd(data + end, mapped->size - end, '\n');
+    if (newline == NULL) {
+        return mapped->size;
+    }
+    size_t aligned = (size_t)(newline - data) + 1;
+    return aligned > mapped->size ? mapped->size : aligned;
 }
 
 static int aklv_line_index_grow_block_arrays(AklvLineIndex *index, char *error, size_t error_cap) {
@@ -1424,6 +1842,237 @@ static int aklv_line_index_append(AklvLineIndex *index,
                                          max_grams,
                                          error,
                                          error_cap);
+}
+
+static void *aklv_line_build_worker_main(void *arg) {
+    AklvLineBuildTask *task = (AklvLineBuildTask *)arg;
+    const AklvMappedFile *mapped = task->mapped;
+    if (mapped == NULL || task->start >= task->end || task->start >= mapped->size) {
+        return NULL;
+    }
+    const unsigned char *data = mapped->data;
+    const unsigned char *range_end = data + task->end;
+    const unsigned char *line_start = data + task->start;
+    uint64_t max_line_count = (uint64_t)(task->end - task->start) + 1U;
+    uint64_t max_block_count = (max_line_count + AKLV_LINE_INDEX_BLOCK_LINES - 1) >>
+                               AKLV_LINE_INDEX_BLOCK_SHIFT;
+    if (aklv_line_index_reserve_block_arrays(&task->line_index,
+                                             max_block_count,
+                                             task->error,
+                                             sizeof(task->error)) != 0) {
+        task->status = -1;
+        return NULL;
+    }
+    uint64_t check_counter = 0;
+    while (line_start < range_end) {
+        if (task->build_cancel != NULL &&
+            atomic_load_explicit(task->build_cancel, memory_order_relaxed)) {
+            task->status = -2;
+            snprintf(task->error, sizeof(task->error), "%s", "index build cancelled");
+            break;
+        }
+        if ((check_counter++ & 0x3fffU) == 0 &&
+            task->cancel != NULL &&
+            atomic_load_explicit(task->cancel, memory_order_relaxed)) {
+            task->status = -2;
+            snprintf(task->error, sizeof(task->error), "%s", "index build cancelled");
+            if (task->build_cancel != NULL) {
+                atomic_store_explicit(task->build_cancel, true, memory_order_relaxed);
+            }
+            break;
+        }
+        const unsigned char *newline =
+            aklv_find_byte_simd(line_start, (size_t)(range_end - line_start), '\n');
+        const unsigned char *line_end = newline == NULL ? range_end : newline;
+        AklvLineView line;
+        line.start = line_start;
+        line.len = (size_t)(line_end - line_start);
+        uint32_t prefix_skip = aklv_effective_prefix_skip(line);
+        size_t effective_len = line.len;
+        if (prefix_skip != AKLV_LINE_PREFIX_OVERFLOW) {
+            effective_len = prefix_skip < line.len ? line.len - prefix_skip : 0;
+        }
+        size_t max_grams = effective_len >= AKLV_ASCII_GRAM_MAX_SIZE
+            ? effective_len - AKLV_ASCII_GRAM_MAX_SIZE + 1
+            : 0;
+        size_t offset = (size_t)(line_start - data);
+        if (aklv_line_index_append(&task->line_index,
+                                   offset,
+                                   prefix_skip,
+                                   max_grams,
+                                   task->error,
+                                   sizeof(task->error)) != 0) {
+            task->status = -1;
+            if (task->build_cancel != NULL) {
+                atomic_store_explicit(task->build_cancel, true, memory_order_relaxed);
+            }
+            break;
+        }
+        if (newline == NULL || newline + 1 >= range_end) {
+            break;
+        }
+        line_start = newline + 1;
+    }
+    if (task->status != 0) {
+        aklv_line_index_destroy(&task->line_index);
+    }
+    return NULL;
+}
+
+static int aklv_line_index_move_append(AklvLineIndex *dst,
+                                       AklvLineIndex *src,
+                                       char *error,
+                                       size_t error_cap) {
+    if (src == NULL || src->count == 0) {
+        aklv_line_index_destroy(src);
+        return 0;
+    }
+    for (uint64_t pos = 0; pos < src->count; pos++) {
+        uint64_t block = pos >> AKLV_LINE_INDEX_BLOCK_SHIFT;
+        size_t packed = src->offset_blocks[block][pos & AKLV_LINE_INDEX_BLOCK_MASK];
+        size_t max_grams = src->block_max_grams[block];
+        if (aklv_line_index_append_packed(dst, packed, max_grams, error, error_cap) != 0) {
+            return -1;
+        }
+    }
+    aklv_line_index_destroy(src);
+    return 0;
+}
+
+static int aklv_build_line_offsets_parallel(const AklvMappedFile *mapped,
+                                            AklvLineIndex *index,
+                                            uint32_t thread_count,
+                                            const atomic_bool *cancel,
+                                            char *error,
+                                            size_t error_cap) {
+    if (thread_count <= 1 || mapped->size < (1U << 20)) {
+        const unsigned char *end = mapped->data + mapped->size;
+        const unsigned char *line_start = mapped->data;
+        uint64_t max_line_count = (uint64_t)mapped->size;
+        uint64_t max_block_count = (max_line_count + AKLV_LINE_INDEX_BLOCK_LINES - 1) >>
+                                   AKLV_LINE_INDEX_BLOCK_SHIFT;
+        if (aklv_line_index_reserve_block_arrays(index, max_block_count, error, error_cap) != 0) {
+            return -1;
+        }
+        uint64_t check_counter = 0;
+        while (line_start < end) {
+            if ((check_counter++ & 0x3fffU) == 0 &&
+                cancel != NULL &&
+                atomic_load_explicit(cancel, memory_order_relaxed)) {
+                aklv_set_error(error, error_cap, "index build cancelled");
+                return -2;
+            }
+
+            const unsigned char *newline =
+                aklv_find_byte_simd(line_start, (size_t)(end - line_start), '\n');
+            const unsigned char *line_end = newline == NULL ? end : newline;
+            AklvLineView line;
+            line.start = line_start;
+            line.len = (size_t)(line_end - line_start);
+            uint32_t prefix_skip = aklv_effective_prefix_skip(line);
+            size_t effective_len = line.len;
+            if (prefix_skip != AKLV_LINE_PREFIX_OVERFLOW) {
+                effective_len = prefix_skip < line.len ? line.len - prefix_skip : 0;
+            }
+            size_t max_grams = effective_len >= AKLV_ASCII_GRAM_MAX_SIZE
+                ? effective_len - AKLV_ASCII_GRAM_MAX_SIZE + 1
+                : 0;
+            size_t offset = (size_t)(line_start - mapped->data);
+
+            if (aklv_line_index_append(index,
+                                       offset,
+                                       prefix_skip,
+                                       max_grams,
+                                       error,
+                                       error_cap) != 0) {
+                return -1;
+            }
+
+            if (newline == NULL || newline + 1 >= end) {
+                break;
+            }
+            line_start = newline + 1;
+        }
+        return 0;
+    }
+
+    AklvLineBuildTask *tasks = calloc(thread_count, sizeof(*tasks));
+    pthread_t *threads = calloc(thread_count, sizeof(*threads));
+    if (tasks == NULL || threads == NULL) {
+        free(tasks);
+        free(threads);
+        aklv_set_error(error, error_cap, "calloc failed while allocating line build tasks");
+        return -1;
+    }
+    atomic_bool build_cancel;
+    atomic_init(&build_cancel, false);
+    uint32_t task_count = 0;
+    size_t previous_end = 0;
+    for (uint32_t i = 0; i < thread_count; i++) {
+        size_t raw_end = i + 1 == thread_count
+            ? mapped->size
+            : (size_t)(((uint64_t)mapped->size * (uint64_t)(i + 1)) / thread_count);
+        size_t aligned_end = i + 1 == thread_count
+            ? mapped->size
+            : aklv_line_build_align_end(mapped, raw_end);
+        if (aligned_end < previous_end) {
+            aligned_end = previous_end;
+        }
+        tasks[task_count].mapped = mapped;
+        tasks[task_count].start = previous_end;
+        tasks[task_count].end = aligned_end;
+        tasks[task_count].cancel = cancel;
+        tasks[task_count].build_cancel = &build_cancel;
+        previous_end = aligned_end;
+        task_count++;
+        if (previous_end >= mapped->size) {
+            break;
+        }
+    }
+    uint32_t created_threads = 0;
+    int rc = 0;
+    for (uint32_t i = 0; i < task_count; i++) {
+        int pthread_rc = pthread_create(&threads[i], NULL, aklv_line_build_worker_main, &tasks[i]);
+        if (pthread_rc != 0) {
+            aklv_set_error(error,
+                           error_cap,
+                           "pthread_create failed while building line index: %s",
+                           strerror(pthread_rc));
+            atomic_store_explicit(&build_cancel, true, memory_order_relaxed);
+            rc = -1;
+            break;
+        }
+        created_threads++;
+    }
+    for (uint32_t i = 0; i < created_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    if (rc == 0) {
+        for (uint32_t i = 0; i < task_count; i++) {
+            if (tasks[i].status != 0) {
+                rc = tasks[i].status;
+                aklv_set_error(error,
+                               error_cap,
+                               "%s",
+                               tasks[i].error[0] != '\0' ? tasks[i].error : "line index build failed");
+                break;
+            }
+        }
+    }
+    if (rc == 0) {
+        for (uint32_t i = 0; i < task_count; i++) {
+            if (aklv_line_index_move_append(index, &tasks[i].line_index, error, error_cap) != 0) {
+                rc = -1;
+                break;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < task_count; i++) {
+        aklv_line_index_destroy(&tasks[i].line_index);
+    }
+    free(threads);
+    free(tasks);
+    return rc;
 }
 
 static bool aklv_cache_write_padding(FILE *stream, size_t bytes) {
@@ -2218,7 +2867,8 @@ static int aklv_line_index_collect_ascii_grams_for_run(AklvGramScratch *scratch,
     return 0;
 }
 
-static int aklv_line_index_add_ngrams(AklvGramIndex *gram_index,
+static int aklv_line_index_add_ngrams(AklvGramPairPartitions *pairs,
+                                      AklvGramIndex *partition_indexes,
                                       AklvLineView effective,
                                       uint64_t line_no,
                                       AklvGramScratch *scratch,
@@ -2260,8 +2910,11 @@ static int aklv_line_index_add_ngrams(AklvGramIndex *gram_index,
         }
     }
     for (uint64_t gram_i = 0; gram_i < scratch->count; gram_i++) {
-        if (!aklv_gram_index_add(gram_index, scratch->items[gram_i], line_no)) {
-            aklv_set_error(error, error_cap, "failed to append ngram posting");
+        if (!aklv_gram_pair_partitions_append(pairs,
+                                              scratch->items[gram_i],
+                                              line_no,
+                                              partition_indexes)) {
+            aklv_set_error(error, error_cap, "failed to append ngram pair");
             return -1;
         }
     }
@@ -2320,16 +2973,25 @@ static AklvLineView aklv_line_index_effective_line_for_build(const AklvMappedFil
     return line;
 }
 
-static uint64_t aklv_gram_build_task_byte_span(const AklvGramBuildTask *task) {
-    if (task->first_line == 0 || task->last_line < task->first_line || task->line_index->count == 0) {
-        return 0;
+static uint64_t aklv_line_index_lower_bound_offset(const AklvLineIndex *index, size_t offset) {
+    if (index == NULL || index->count == 0) {
+        return 1;
     }
-    size_t first_offset = aklv_line_index_offset(task->line_index, task->first_line);
-    size_t end_offset = task->mapped->size;
-    if (task->last_line < task->line_index->count) {
-        end_offset = aklv_line_index_offset(task->line_index, task->last_line + 1);
+    uint64_t lo = 1;
+    uint64_t hi = index->count + 1;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        size_t mid_offset = aklv_line_index_offset(index, mid);
+        if (mid_offset < offset) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
-    return end_offset > first_offset ? (uint64_t)(end_offset - first_offset) : 0;
+    if (lo > index->count) {
+        return index->count + 1;
+    }
+    return lo;
 }
 
 static size_t aklv_gram_build_task_max_line_grams(const AklvGramBuildTask *task) {
@@ -2360,17 +3022,11 @@ static size_t aklv_gram_build_task_max_line_grams(const AklvGramBuildTask *task)
 static void *aklv_gram_build_worker_main(void *arg) {
     AklvGramBuildTask *task = (AklvGramBuildTask *)arg;
     AklvGramScratch scratch = {0};
-    uint64_t reserve_count =
-        aklv_gram_build_task_byte_span(task) / AKLV_WORKER_GRAM_RESERVE_BYTES_PER_GRAM + 1U;
-    if (reserve_count > AKLV_WORKER_GRAM_RESERVE_MAX) {
-        reserve_count = AKLV_WORKER_GRAM_RESERVE_MAX;
-    }
-    if (reserve_count > AKLV_ASCII_GRAM_KEY_SPACE) {
-        reserve_count = AKLV_ASCII_GRAM_KEY_SPACE;
-    }
-    if (!aklv_gram_index_reserve_for_count(&task->gram_index, reserve_count)) {
+    AklvGramPairPartitions pairs = {0};
+    task->partition_indexes = calloc(AKLV_GRAM_PARTITION_COUNT, sizeof(*task->partition_indexes));
+    if (task->partition_indexes == NULL) {
         task->status = -1;
-        snprintf(task->error, sizeof(task->error), "%s", "failed to reserve worker gram index");
+        snprintf(task->error, sizeof(task->error), "%s", "failed to allocate worker partition indexes");
         return NULL;
     }
     size_t max_line_grams = aklv_gram_build_task_max_line_grams(task);
@@ -2403,7 +3059,8 @@ static void *aklv_gram_build_worker_main(void *arg) {
         }
         AklvLineView effective =
             aklv_line_index_effective_line_for_build(task->mapped, task->line_index, line_no);
-        if (aklv_line_index_add_ngrams(&task->gram_index,
+        if (aklv_line_index_add_ngrams(&pairs,
+                                       task->partition_indexes,
                                        effective,
                                        line_no,
                                        &scratch,
@@ -2416,7 +3073,25 @@ static void *aklv_gram_build_worker_main(void *arg) {
             }
             break;
         }
+        if (pairs.total_count >= AKLV_GRAM_PAIR_FLUSH_COUNT &&
+            !aklv_gram_pair_partitions_flush_one(&pairs, task->partition_indexes)) {
+            task->status = -1;
+            snprintf(task->error, sizeof(task->error), "%s", "failed to flush ngram pairs");
+            if (task->build_cancel != NULL) {
+                atomic_store_explicit(task->build_cancel, true, memory_order_relaxed);
+            }
+            break;
+        }
     }
+    if (task->status == 0 &&
+        !aklv_gram_pair_partitions_flush_all(&pairs, task->partition_indexes)) {
+        task->status = -1;
+        snprintf(task->error, sizeof(task->error), "%s", "failed to flush ngram pairs");
+        if (task->build_cancel != NULL) {
+            atomic_store_explicit(task->build_cancel, true, memory_order_relaxed);
+        }
+    }
+    aklv_gram_pair_partitions_destroy(&pairs);
     aklv_gram_scratch_destroy(&scratch);
     return NULL;
 }
@@ -2431,64 +3106,21 @@ int aklv_build_line_index(const AklvMappedFile *mapped,
         return 0;
     }
 
-    const unsigned char *end = mapped->data + mapped->size;
-    const unsigned char *line_start = mapped->data;
-    uint64_t max_line_count = (uint64_t)mapped->size;
-    uint64_t max_block_count = (max_line_count + AKLV_LINE_INDEX_BLOCK_LINES - 1) >>
-                               AKLV_LINE_INDEX_BLOCK_SHIFT;
-    if (aklv_line_index_reserve_block_arrays(index, max_block_count, error, error_cap) != 0) {
+    uint32_t thread_count = aklv_default_index_thread_count();
+    int line_rc = aklv_build_line_offsets_parallel(mapped,
+                                                   index,
+                                                   thread_count,
+                                                   cancel,
+                                                   error,
+                                                   error_cap);
+    if (line_rc != 0) {
         aklv_line_index_destroy(index);
-        return -1;
-    }
-    uint64_t check_counter = 0;
-    while (line_start < end) {
-        if ((check_counter++ & 0x3fffU) == 0 && cancel != NULL && atomic_load_explicit(cancel, memory_order_relaxed)) {
-            aklv_set_error(error, error_cap, "index build cancelled");
-            aklv_line_index_destroy(index);
-            return -2;
-        }
-
-        const unsigned char *newline = aklv_find_byte_simd(line_start, (size_t)(end - line_start), '\n');
-        const unsigned char *line_end = newline == NULL ? end : newline;
-        AklvLineView line;
-        line.start = line_start;
-        line.len = (size_t)(line_end - line_start);
-        uint32_t prefix_skip = aklv_effective_prefix_skip(line);
-        size_t effective_len = line.len;
-        if (prefix_skip != AKLV_LINE_PREFIX_OVERFLOW) {
-            effective_len = prefix_skip < line.len ? line.len - prefix_skip : 0;
-        }
-        size_t max_grams = effective_len >= AKLV_ASCII_GRAM_MAX_SIZE
-            ? effective_len - AKLV_ASCII_GRAM_MAX_SIZE + 1
-            : 0;
-        size_t offset = (size_t)(line_start - mapped->data);
-
-        if (aklv_line_index_append(index,
-                                   offset,
-                                   prefix_skip,
-                                   max_grams,
-                                   error,
-                                   error_cap) != 0) {
-            aklv_line_index_destroy(index);
-            return -1;
-        }
-
-        if (newline == NULL || newline + 1 >= end) {
-            break;
-        }
-        line_start = newline + 1;
-    }
-
-    if (cancel != NULL && atomic_load_explicit(cancel, memory_order_relaxed)) {
-        aklv_set_error(error, error_cap, "index build cancelled");
-        aklv_line_index_destroy(index);
-        return -2;
+        return line_rc;
     }
     if (index->count == 0) {
         return 0;
     }
 
-    uint32_t thread_count = aklv_default_index_thread_count();
     if ((uint64_t)thread_count > index->count) {
         thread_count = (uint32_t)index->count;
     }
@@ -2515,18 +3147,33 @@ int aklv_build_line_index(const AklvMappedFile *mapped,
 
     atomic_bool build_cancel;
     atomic_init(&build_cancel, false);
-    uint64_t base_lines = index->count / thread_count;
-    uint64_t extra_lines = index->count % thread_count;
-    uint64_t first_line = 1;
+    uint64_t previous_last_line = 0;
     for (uint32_t i = 0; i < thread_count; i++) {
-        uint64_t span = base_lines + (i < extra_lines ? 1 : 0);
+        uint64_t first_line = previous_last_line + 1;
+        uint64_t last_line = index->count;
+        if (i + 1 < thread_count) {
+            uint64_t next_byte = ((uint64_t)mapped->size * (uint64_t)(i + 1)) / thread_count;
+            uint64_t next_line = aklv_line_index_lower_bound_offset(index, (size_t)next_byte);
+            if (next_line <= first_line) {
+                next_line = first_line + 1;
+            }
+            uint64_t remaining_tasks = (uint64_t)thread_count - i - 1;
+            uint64_t max_next_line = index->count + 1 - remaining_tasks;
+            if (next_line > max_next_line) {
+                next_line = max_next_line;
+            }
+            last_line = next_line - 1;
+        }
+        if (last_line < first_line) {
+            last_line = first_line;
+        }
         tasks[i].mapped = mapped;
         tasks[i].line_index = index;
         tasks[i].first_line = first_line;
-        tasks[i].last_line = first_line + span - 1;
+        tasks[i].last_line = last_line;
         tasks[i].cancel = cancel;
         tasks[i].build_cancel = &build_cancel;
-        first_line = tasks[i].last_line + 1;
+        previous_last_line = last_line;
     }
 
     uint32_t created_threads = 0;
@@ -2565,30 +3212,24 @@ int aklv_build_line_index(const AklvMappedFile *mapped,
         }
     }
     if (rc == 0) {
-        uint64_t merged_count = 0;
-        if (!aklv_gram_build_union_count(tasks, thread_count, &merged_count) ||
-            !aklv_gram_index_reserve_for_count(&index->gram_index, merged_count)) {
-            aklv_set_error(error, error_cap, "failed to reserve merged index table");
-            rc = -1;
-        }
-    }
-    if (rc == 0) {
-        for (uint32_t i = 0; i < thread_count; i++) {
-            if (cancel != NULL && atomic_load_explicit(cancel, memory_order_relaxed)) {
-                aklv_set_error(error, error_cap, "index build cancelled");
-                rc = -2;
-                break;
-            }
-            if (!aklv_gram_index_merge_move(&index->gram_index, &tasks[i].gram_index)) {
-                aklv_set_error(error, error_cap, "failed to merge index build workers");
-                rc = -1;
-                break;
-            }
-        }
+        rc = aklv_merge_worker_indexes_by_partition(index,
+                                                    tasks,
+                                                    thread_count,
+                                                    thread_count,
+                                                    cancel,
+                                                    error,
+                                                    error_cap);
     }
 
     for (uint32_t i = 0; i < thread_count; i++) {
-        aklv_gram_index_destroy(&tasks[i].gram_index);
+        if (tasks[i].partition_indexes != NULL) {
+            for (uint32_t partition_id = 0;
+                 partition_id < AKLV_GRAM_PARTITION_COUNT;
+                 partition_id++) {
+                aklv_gram_index_destroy(&tasks[i].partition_indexes[partition_id]);
+            }
+            free(tasks[i].partition_indexes);
+        }
     }
     free(threads);
     free(tasks);
