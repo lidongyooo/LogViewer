@@ -369,15 +369,13 @@ static const unsigned char *aklv_memmem_simple(const unsigned char *haystack,
 static const unsigned char *aklv_find_ascii_case_byte(const unsigned char *text,
                                                       size_t len,
                                                       unsigned char folded) {
-    const unsigned char *hit = aklv_find_byte_simd(text, len, folded);
     if (folded >= 'a' && folded <= 'z') {
-        const unsigned char *upper =
-            aklv_find_byte_simd(text, len, (unsigned char)(folded - ('a' - 'A')));
-        if (hit == NULL || (upper != NULL && upper < hit)) {
-            hit = upper;
-        }
+        return aklv_find_either_byte_simd(text,
+                                          len,
+                                          folded,
+                                          (unsigned char)(folded - ('a' - 'A')));
     }
-    return hit;
+    return aklv_find_byte_simd(text, len, folded);
 }
 
 static unsigned char aklv_ascii_lower_byte(unsigned char c) {
@@ -387,23 +385,31 @@ static unsigned char aklv_ascii_lower_byte(unsigned char c) {
     return c;
 }
 
-static bool aklv_ascii_case_equal(const unsigned char *text, const char *needle, size_t needle_len) {
+static void aklv_fold_ascii_pattern(unsigned char *out, const char *text, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        out[i] = aklv_ascii_lower_byte((unsigned char)text[i]);
+    }
+}
+
+static bool aklv_ascii_case_equal_folded(const unsigned char *text,
+                                         const unsigned char *folded_needle,
+                                         size_t needle_len) {
     for (size_t i = 0; i < needle_len; i++) {
-        if (aklv_ascii_lower_byte(text[i]) != aklv_ascii_lower_byte((unsigned char)needle[i])) {
+        if (aklv_ascii_lower_byte(text[i]) != folded_needle[i]) {
             return false;
         }
     }
     return true;
 }
 
-static const unsigned char *aklv_memmem_ascii_case(const unsigned char *haystack,
-                                                   size_t haystack_len,
-                                                   const char *needle,
-                                                   size_t needle_len) {
+static const unsigned char *aklv_memmem_ascii_case_folded(const unsigned char *haystack,
+                                                          size_t haystack_len,
+                                                          const unsigned char *folded_needle,
+                                                          size_t needle_len) {
     if (needle_len == 0 || haystack_len < needle_len) {
         return NULL;
     }
-    unsigned char first = aklv_ascii_lower_byte((unsigned char)needle[0]);
+    unsigned char first = folded_needle[0];
     const unsigned char *scan = haystack;
     size_t remaining = haystack_len;
     while (remaining >= needle_len) {
@@ -412,7 +418,7 @@ static const unsigned char *aklv_memmem_ascii_case(const unsigned char *haystack
         if (hit == NULL) {
             return NULL;
         }
-        if (aklv_ascii_case_equal(hit, needle, needle_len)) {
+        if (aklv_ascii_case_equal_folded(hit, folded_needle, needle_len)) {
             return hit;
         }
         size_t consumed = (size_t)(hit - scan) + 1;
@@ -429,16 +435,19 @@ static void aklv_draw_match_highlights(AklvMetalRenderer *r,
                                        float char_w,
                                        const unsigned char *text,
                                        size_t len,
-                                       const char *needle,
+                                       const unsigned char *folded_needle,
                                        size_t needle_len,
                                        AklvColor color) {
-    if (text == NULL || needle == NULL || needle_len == 0 || len < needle_len) {
+    if (text == NULL || folded_needle == NULL || needle_len == 0 || len < needle_len) {
         return;
     }
     const unsigned char *scan = text;
     size_t remaining = len;
     while (remaining >= needle_len) {
-        const unsigned char *hit = aklv_memmem_ascii_case(scan, remaining, needle, needle_len);
+        const unsigned char *hit = aklv_memmem_ascii_case_folded(scan,
+                                                                 remaining,
+                                                                 folded_needle,
+                                                                 needle_len);
         if (hit == NULL) {
             break;
         }
@@ -1205,6 +1214,13 @@ static void aklv_draw_text_view(AklvApp *app, AklvRect rect) {
     size_t max_chars = (size_t)((rect.w - AKLV_LINE_NO_W - AKLV_SCROLLBAR_W - 18.0f) / char_w) + 2;
     const char *search_query = app->search_results.query;
     size_t search_query_len = strlen(search_query);
+    unsigned char folded_search_query[AKLV_SEARCH_QUERY_CAP];
+    if (search_query_len > sizeof(folded_search_query)) {
+        search_query_len = sizeof(folded_search_query);
+    }
+    if (search_query_len > 0) {
+        aklv_fold_ascii_pattern(folded_search_query, search_query, search_query_len);
+    }
     bool has_text_selection = aklv_app_text_selection_non_empty(app);
     uint64_t sel_start_line = 0;
     uint64_t sel_end_line = 0;
@@ -1234,7 +1250,7 @@ static void aklv_draw_text_view(AklvApp *app, AklvRect rect) {
         int number_len = snprintf(number, sizeof(number), "%8" PRIu64, line_no);
         size_t number_size = number_len > 0 && (size_t)number_len < sizeof(number)
             ? (size_t)number_len
-            : strlen(number);
+            : sizeof(number) - 1;
         aklv_metal_push_text(r, rect.x + 8.0f, y + 1.0f, number, number_size, C_LINE_NO);
 
         AklvLineView line = aklv_file_line_fast(file, line_no);
@@ -1279,7 +1295,7 @@ static void aklv_draw_text_view(AklvApp *app, AklvRect rect) {
                                            char_w,
                                            line.start + col,
                                            len,
-                                           search_query,
+                                           folded_search_query,
                                            search_query_len,
                                            C_SEARCH_HIGHLIGHT);
             }
@@ -1387,7 +1403,7 @@ static void aklv_draw_search_panel(AklvApp *app, AklvRect rect) {
         int elapsed_len = snprintf(elapsed, sizeof(elapsed), "%.3fs", app->search_results.elapsed_sec);
         size_t elapsed_size = elapsed_len > 0 && (size_t)elapsed_len < sizeof(elapsed)
             ? (size_t)elapsed_len
-            : strlen(elapsed);
+            : sizeof(elapsed) - 1;
         float elapsed_w = (float)elapsed_size * char_w;
         aklv_metal_push_text(r,
                              rect.x + rect.w - AKLV_SCROLLBAR_W - elapsed_w - 12.0f,
@@ -1399,6 +1415,13 @@ static void aklv_draw_search_panel(AklvApp *app, AklvRect rect) {
 
     const char *query = app->search_results.query;
     size_t query_len = strlen(query);
+    unsigned char folded_query[AKLV_SEARCH_QUERY_CAP];
+    if (query_len > sizeof(folded_query)) {
+        query_len = sizeof(folded_query);
+    }
+    if (query_len > 0) {
+        aklv_fold_ascii_pattern(folded_query, query, query_len);
+    }
     float list_y = rect.y + AKLV_SEARCH_HEADER_H;
     float list_h = rect.h - AKLV_SEARCH_HEADER_H;
     aklv_metal_push_rect(r, rect.x, list_y, rect.w, list_h, C_BG);
@@ -1406,6 +1429,9 @@ static void aklv_draw_search_panel(AklvApp *app, AklvRect rect) {
     uint64_t first = (uint64_t)floor(app->search_scroll);
     double frac = app->search_scroll - floor(app->search_scroll);
     uint64_t visible = (uint64_t)(list_h / line_h) + 2;
+    uint32_t cached_file_id = 0;
+    AklvFile *cached_result_file = NULL;
+    bool cached_file_valid = false;
     for (uint64_t row = 0; row < visible; row++) {
         uint64_t index = first + row;
         if (index >= app->search_results.count) {
@@ -1421,21 +1447,27 @@ static void aklv_draw_search_panel(AklvApp *app, AklvRect rect) {
             aklv_metal_push_rect(r, rect.x, y, rect.w - AKLV_SCROLLBAR_W, line_h, (AklvColor){0.118f, 0.132f, 0.160f, 1.0f});
         }
         AklvSearchResult *item = &app->search_results.items[index];
-        AklvFile *result_file = aklv_app_find_file_by_id(app, item->file_id, NULL);
+        AklvFile *result_file = NULL;
+        if (cached_file_valid && cached_file_id == item->file_id) {
+            result_file = cached_result_file;
+        } else {
+            result_file = aklv_app_find_file_by_id(app, item->file_id, NULL);
+            cached_file_id = item->file_id;
+            cached_result_file = result_file;
+            cached_file_valid = true;
+        }
         const char *file_name = result_file != NULL ? result_file->name : "(closed)";
         char snippet[AKLV_SEARCH_SNIPPET_LIMIT + 4];
+        size_t snippet_len = 0;
         bool snippet_truncated = false;
         if (result_file != NULL) {
             AklvLineView line = aklv_file_line_fast(result_file, item->line_no);
-            aklv_copy_line_snippet(line, snippet, sizeof(snippet), &snippet_truncated);
-            if (snippet_truncated) {
-                size_t snippet_len = strlen(snippet);
-                if (snippet_len + 3 < sizeof(snippet)) {
-                    snippet[snippet_len++] = '.';
-                    snippet[snippet_len++] = '.';
-                    snippet[snippet_len++] = '.';
-                    snippet[snippet_len] = '\0';
-                }
+            snippet_len = aklv_copy_line_snippet(line, snippet, sizeof(snippet), &snippet_truncated);
+            if (snippet_truncated && snippet_len + 3 < sizeof(snippet)) {
+                snippet[snippet_len++] = '.';
+                snippet[snippet_len++] = '.';
+                snippet[snippet_len++] = '.';
+                snippet[snippet_len] = '\0';
             }
         } else {
             snippet[0] = '\0';
@@ -1449,10 +1481,9 @@ static void aklv_draw_search_panel(AklvApp *app, AklvRect rect) {
                                      item->line_no);
         size_t prefix_len = prefix_result > 0 && (size_t)prefix_result < sizeof(prefix)
             ? (size_t)prefix_result
-            : strlen(prefix);
+            : sizeof(prefix) - 1;
         aklv_metal_push_text(r, rect.x + 10.0f, y + 1.0f, prefix, prefix_len, C_LINE_NO);
         float text_x = rect.x + 10.0f + (float)prefix_len * char_w;
-        size_t snippet_len = strlen(snippet);
         if (query_len > 0) {
             aklv_draw_match_highlights(r,
                                        text_x,
@@ -1461,7 +1492,7 @@ static void aklv_draw_search_panel(AklvApp *app, AklvRect rect) {
                                        char_w,
                                        (const unsigned char *)snippet,
                                        snippet_len,
-                                       query,
+                                       folded_query,
                                        query_len,
                                        C_SEARCH_HIGHLIGHT);
         }

@@ -67,11 +67,10 @@ The index is optimized for exact search over very large trace/log files:
 - block-based line-offset index, 65536 lines per block
 - ASCII-derived 3-byte fragment inverted index backed by lightweight
   Roaring-style bitmaps of line numbers
-- finished indexes are cached under `indexs/` as `<md5>_N.index` shards, where
-  the MD5 input is the resolved full path plus basename; shards are capped at
-  1 GiB serialized size
-- reopening an unchanged file restores line offsets from cache and loads only
-  one index shard per file at a time while searching
+- finished indexes are cached under `indexs/` as `<md5>.index`, where
+  the MD5 input is the resolved full path plus basename
+- reopening an unchanged file restores line offsets from cache immediately and
+  lazy-loads the complete serialized gram index on first indexed search
 - index construction is split into a sequential line-offset pass and a
   parallel per-line-range gram build/merge pass
 - search-effective line content skips the prefix from line start through `!` when the line starts with `[`

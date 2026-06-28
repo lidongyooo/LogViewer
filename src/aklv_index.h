@@ -15,10 +15,7 @@
 #define AKLV_LINE_PREFIX_OVERFLOW UINT32_C(0xffff)
 #define AKLV_SEARCH_SNIPPET_LIMIT 300
 #define AKLV_ASCII_GRAM_MAX_SIZE 3
-#define AKLV_INDEX_CACHE_VERSION UINT32_C(3)
-#ifndef AKLV_INDEX_SHARD_MAX_BYTES
-#define AKLV_INDEX_SHARD_MAX_BYTES UINT64_C(1073741824)
-#endif
+#define AKLV_INDEX_CACHE_VERSION UINT32_C(4)
 
 typedef enum {
     AKLV_ROARING_ARRAY = 0,
@@ -89,16 +86,6 @@ typedef struct {
 } AklvGramIndex;
 
 typedef struct {
-    uint32_t shard_index;
-    uint64_t first_line;
-    uint64_t last_line;
-    char *path;
-    bool gram_index_loaded;
-    bool gram_index_loading;
-    AklvGramIndex gram_index;
-} AklvIndexCacheShard;
-
-typedef struct {
     bool available;
     bool mutex_initialized;
     bool cond_initialized;
@@ -106,9 +93,18 @@ typedef struct {
     pthread_cond_t cond;
     char hash[33];
     char *dir;
-    AklvIndexCacheShard *shards;
-    uint32_t shard_count;
-    uint32_t shard_capacity;
+    char *path;
+    uint64_t file_size;
+    uint64_t file_mtime_sec;
+    uint64_t file_mtime_nsec;
+    uint64_t line_count;
+    uint64_t offset_count;
+    bool gram_index_loaded;
+    bool gram_index_loading;
+    uint64_t gram_count;
+    uint32_t total_container_count;
+    uint64_t payload_bytes;
+    AklvGramIndex gram_index;
 } AklvIndexCache;
 
 typedef struct {
@@ -132,6 +128,10 @@ typedef struct AklvFile {
 
 unsigned char aklv_fold_ascii_byte(unsigned char c);
 const unsigned char *aklv_find_byte_simd(const unsigned char *text, size_t len, unsigned char needle);
+const unsigned char *aklv_find_either_byte_simd(const unsigned char *text,
+                                                size_t len,
+                                                unsigned char first,
+                                                unsigned char second);
 bool aklv_is_index_byte(unsigned char c);
 
 static inline size_t aklv_line_index_pack_offset(size_t offset, uint32_t prefix_skip) {
@@ -178,17 +178,11 @@ int aklv_index_cache_store(const char *path,
                            AklvLineIndex *index,
                            char *error,
                            size_t error_cap);
-int aklv_index_cache_load_shard(const AklvIndexCacheShard *shard,
-                                const AklvMappedFile *mapped,
-                                AklvGramIndex *gram_index,
-                                char *error,
-                                size_t error_cap);
-int aklv_index_cache_get_shard_index(AklvIndexCache *cache,
-                                     AklvIndexCacheShard *shard,
-                                     const AklvMappedFile *mapped,
-                                     const AklvGramIndex **gram_index,
-                                     char *error,
-                                     size_t error_cap);
+int aklv_index_cache_get_index(AklvIndexCache *cache,
+                               const AklvMappedFile *mapped,
+                               const AklvGramIndex **gram_index,
+                               char *error,
+                               size_t error_cap);
 size_t aklv_line_index_offset(const AklvLineIndex *index, uint64_t line_no);
 uint32_t aklv_line_index_prefix_skip(const AklvLineIndex *index, uint64_t line_no);
 

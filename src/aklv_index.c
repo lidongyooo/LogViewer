@@ -32,8 +32,6 @@
 #define AKLV_INDEX_CACHE_MAGIC "AKLVIDX1"
 #define AKLV_INDEX_CACHE_HEADER_SIZE 4096
 #define AKLV_CACHE_STREAM_BUFFER_BYTES (50 * 1024 * 1024)
-#define AKLV_CACHE_U16_WRITE_BATCH (8192 * 50)
-#define AKLV_CACHE_RUN_WRITE_BATCH (2048 * 50)
 #define AKLV_CACHE_OFFSET_CONVERT_BATCH (8192 * 50)
 #define AKLV_ASCII_GRAM_KEY_SPACE UINT64_C(2097152)
 #define AKLV_ASCII_GRAM_KEY_SPACE_WORDS (AKLV_ASCII_GRAM_KEY_SPACE / 64)
@@ -60,7 +58,7 @@ typedef struct {
 typedef struct {
     char magic[8];
     uint32_t version;
-    uint32_t shard_index;
+    uint32_t reserved;
     uint64_t file_size;
     uint64_t file_mtime_sec;
     uint64_t file_mtime_nsec;
@@ -95,52 +93,10 @@ typedef struct {
 } AklvCacheFileIdentity;
 
 typedef struct {
-    uint32_t cardinality;
-    uint32_t run_count;
-    AklvRoaringContainerType type;
-    uint32_t payload_count;
-    size_t payload_bytes;
-    uint16_t single_run_start;
-    uint16_t single_run_end;
-    bool single_run_direct;
-    bool full_container_direct;
-} AklvContainerRangePlan;
-
-typedef struct {
-    uint32_t container_count;
-    uint32_t reserved;
-    uint64_t cardinality;
-    uint64_t serialized_bytes;
-    uint64_t payload_bytes;
-} AklvCachePostingRangePlan;
-
-typedef struct {
-    const AklvRoaringContainer *container;
-    AklvContainerRangePlan plan;
-    uint16_t min_low;
-    uint16_t max_low;
-} AklvCacheContainerWritePlan;
-
-typedef struct {
-    uint64_t *key_bytes;
-    uint64_t key_count;
-    uint64_t *bucket_offsets;
-    uint32_t *posting_indices;
-    uint64_t posting_index_count;
-} AklvCacheKeyPlan;
-
-typedef struct {
     unsigned char *cursor;
     unsigned char *end;
 } AklvCachePayloadArena;
 
-typedef struct {
-    uint16_t *u16_values;
-    AklvRoaringRun *runs;
-    uint64_t *offset_values;
-} AklvCacheWriteScratch;
-
-static uint64_t aklv_cache_saturating_add_u64(uint64_t value, uint64_t add);
 static uint32_t aklv_gram_dense_index(uint32_t gram);
 static uint32_t aklv_lower_bound_u16(const uint16_t *items, uint32_t count, uint16_t value);
 
@@ -234,9 +190,9 @@ static bool aklv_index_cache_hash_path(const char *path, char out[33]) {
     return true;
 }
 
-static char *aklv_index_cache_path_for(const char hash[33], uint32_t shard_index) {
+static char *aklv_index_cache_path_for(const char hash[33]) {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s_%u.index", AKLV_INDEX_CACHE_DIR, hash, shard_index);
+    snprintf(path, sizeof(path), "%s/%s.index", AKLV_INDEX_CACHE_DIR, hash);
     return aklv_strdup(path);
 }
 
@@ -246,13 +202,8 @@ static void aklv_index_cache_destroy(AklvIndexCache *cache) {
     if (cache == NULL) {
         return;
     }
-    if (cache->shards != NULL) {
-        for (uint32_t i = 0; i < cache->shard_count; i++) {
-            aklv_gram_index_destroy(&cache->shards[i].gram_index);
-            free(cache->shards[i].path);
-        }
-        free(cache->shards);
-    }
+    aklv_gram_index_destroy(&cache->gram_index);
+    free(cache->path);
     if (cache->cond_initialized) {
         pthread_cond_destroy(&cache->cond);
     }
@@ -261,37 +212,6 @@ static void aklv_index_cache_destroy(AklvIndexCache *cache) {
     }
     free(cache->dir);
     memset(cache, 0, sizeof(*cache));
-}
-
-static bool aklv_index_cache_add_shard(AklvIndexCache *cache,
-                                       uint32_t shard_index,
-                                       uint64_t first_line,
-                                       uint64_t last_line,
-                                       const char *path) {
-    if (cache->shard_count == cache->shard_capacity) {
-        uint32_t new_capacity = cache->shard_capacity == 0 ? 8 : cache->shard_capacity * 2;
-        if (new_capacity < cache->shard_capacity) {
-            return false;
-        }
-        AklvIndexCacheShard *new_items =
-            realloc(cache->shards, (size_t)new_capacity * sizeof(*new_items));
-        if (new_items == NULL) {
-            return false;
-        }
-        cache->shards = new_items;
-        cache->shard_capacity = new_capacity;
-    }
-    AklvIndexCacheShard *shard = &cache->shards[cache->shard_count++];
-    memset(shard, 0, sizeof(*shard));
-    shard->shard_index = shard_index;
-    shard->first_line = first_line;
-    shard->last_line = last_line;
-    shard->path = aklv_strdup(path);
-    if (shard->path == NULL) {
-        cache->shard_count--;
-        return false;
-    }
-    return true;
 }
 
 unsigned char aklv_fold_ascii_byte(unsigned char c) {
@@ -310,18 +230,21 @@ const unsigned char *aklv_find_byte_simd(const unsigned char *text, size_t len, 
         return NULL;
     }
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    static const uint8_t bitmask_data[16] = {
+        1, 2, 4, 8, 16, 32, 64, 128,
+        1, 2, 4, 8, 16, 32, 64, 128
+    };
     const uint8x16_t target = vdupq_n_u8(needle);
+    const uint8x16_t bitmask = vld1q_u8(bitmask_data);
     size_t i = 0;
     for (; i + 16 <= len; i += 16) {
         uint8x16_t bytes = vld1q_u8(text + i);
         uint8x16_t eq = vceqq_u8(bytes, target);
-        uint64x2_t lanes = vreinterpretq_u64_u8(eq);
-        if ((vgetq_lane_u64(lanes, 0) | vgetq_lane_u64(lanes, 1)) != 0) {
-            for (size_t j = 0; j < 16; j++) {
-                if (text[i + j] == needle) {
-                    return text + i + j;
-                }
-            }
+        uint8x16_t bits = vandq_u8(eq, bitmask);
+        uint16_t mask = (uint16_t)vaddv_u8(vget_low_u8(bits)) |
+                        ((uint16_t)vaddv_u8(vget_high_u8(bits)) << 8);
+        if (mask != 0) {
+            return text + i + (size_t)__builtin_ctz((unsigned)mask);
         }
     }
     for (; i < len; i++) {
@@ -349,6 +272,70 @@ const unsigned char *aklv_find_byte_simd(const unsigned char *text, size_t len, 
     return NULL;
 #else
     return memchr(text, needle, len);
+#endif
+}
+
+const unsigned char *aklv_find_either_byte_simd(const unsigned char *text,
+                                                size_t len,
+                                                unsigned char first,
+                                                unsigned char second) {
+    if (first == second) {
+        return aklv_find_byte_simd(text, len, first);
+    }
+    if (text == NULL || len == 0) {
+        return NULL;
+    }
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    static const uint8_t bitmask_data[16] = {
+        1, 2, 4, 8, 16, 32, 64, 128,
+        1, 2, 4, 8, 16, 32, 64, 128
+    };
+    const uint8x16_t first_target = vdupq_n_u8(first);
+    const uint8x16_t second_target = vdupq_n_u8(second);
+    const uint8x16_t bitmask = vld1q_u8(bitmask_data);
+    size_t i = 0;
+    for (; i + 16 <= len; i += 16) {
+        uint8x16_t bytes = vld1q_u8(text + i);
+        uint8x16_t eq = vorrq_u8(vceqq_u8(bytes, first_target), vceqq_u8(bytes, second_target));
+        uint8x16_t bits = vandq_u8(eq, bitmask);
+        uint16_t mask = (uint16_t)vaddv_u8(vget_low_u8(bits)) |
+                        ((uint16_t)vaddv_u8(vget_high_u8(bits)) << 8);
+        if (mask != 0) {
+            return text + i + (size_t)__builtin_ctz((unsigned)mask);
+        }
+    }
+    for (; i < len; i++) {
+        if (text[i] == first || text[i] == second) {
+            return text + i;
+        }
+    }
+    return NULL;
+#elif defined(__SSE2__)
+    const __m128i first_target = _mm_set1_epi8((char)first);
+    const __m128i second_target = _mm_set1_epi8((char)second);
+    size_t i = 0;
+    for (; i + 16 <= len; i += 16) {
+        __m128i bytes = _mm_loadu_si128((const __m128i *)(const void *)(text + i));
+        __m128i eq = _mm_or_si128(_mm_cmpeq_epi8(bytes, first_target),
+                                  _mm_cmpeq_epi8(bytes, second_target));
+        int mask = _mm_movemask_epi8(eq);
+        if (mask != 0) {
+            return text + i + (size_t)__builtin_ctz((unsigned)mask);
+        }
+    }
+    for (; i < len; i++) {
+        if (text[i] == first || text[i] == second) {
+            return text + i;
+        }
+    }
+    return NULL;
+#else
+    for (size_t i = 0; i < len; i++) {
+        if (text[i] == first || text[i] == second) {
+            return text + i;
+        }
+    }
+    return NULL;
 #endif
 }
 
@@ -1439,349 +1426,6 @@ static int aklv_line_index_append(AklvLineIndex *index,
                                          error_cap);
 }
 
-static void aklv_container_range_stats(const AklvRoaringContainer *container,
-                                       uint16_t min_low,
-                                       uint16_t max_low,
-                                       uint32_t *cardinality_out,
-                                       uint32_t *run_count_out) {
-    uint32_t cardinality = 0;
-    uint32_t run_count = 0;
-    bool in_run = false;
-    uint32_t prev = 0;
-    if (container->type == AKLV_ROARING_FULL) {
-        cardinality = (uint32_t)max_low - (uint32_t)min_low + 1U;
-        run_count = cardinality == 0 ? 0 : 1;
-    } else if (container->type == AKLV_ROARING_RUN) {
-        for (uint32_t i = 0; i < container->run_count; i++) {
-            uint32_t start = container->runs[i].start;
-            uint32_t end = start + container->runs[i].length - 1U;
-            if (end < min_low) {
-                continue;
-            }
-            if (start > max_low) {
-                break;
-            }
-            if (start < min_low) {
-                start = min_low;
-            }
-            if (end > max_low) {
-                end = max_low;
-            }
-            cardinality += end - start + 1U;
-            run_count++;
-        }
-    } else if (container->bitmap != NULL) {
-        uint32_t first_word = min_low >> 6;
-        uint32_t last_word = max_low >> 6;
-        for (uint32_t word_i = first_word; word_i <= last_word; word_i++) {
-            uint64_t bits = container->bitmap[word_i];
-            if (word_i == first_word) {
-                uint32_t skip = min_low & 63U;
-                if (skip != 0) {
-                    bits &= UINT64_MAX << skip;
-                }
-            }
-            if (word_i == last_word) {
-                uint32_t keep = (max_low & 63U) + 1U;
-                if (keep < 64U) {
-                    bits &= (UINT64_C(1) << keep) - 1U;
-                }
-            }
-            while (bits != 0) {
-                uint32_t bit = (uint32_t)__builtin_ctzll(bits);
-                bits &= bits - 1;
-                uint32_t low = (word_i << 6) | bit;
-                if (!in_run || low != prev + 1U) {
-                    run_count++;
-                    in_run = true;
-                }
-                prev = low;
-                cardinality++;
-            }
-            if (word_i == UINT32_MAX) {
-                break;
-            }
-        }
-    } else {
-        for (uint32_t i = 0; i < container->cardinality; i++) {
-            uint16_t low = container->array[i];
-            if (low < min_low) {
-                continue;
-            }
-            if (low > max_low) {
-                break;
-            }
-            if (!in_run || (uint32_t)low != prev + 1U) {
-                run_count++;
-                in_run = true;
-            }
-            prev = low;
-            cardinality++;
-        }
-    }
-    *cardinality_out = cardinality;
-    *run_count_out = run_count;
-}
-
-static bool aklv_container_first_last_low(const AklvRoaringContainer *container,
-                                          uint16_t *first_out,
-                                          uint16_t *last_out) {
-    if (container->cardinality == 0) {
-        return false;
-    }
-    if (container->type == AKLV_ROARING_FULL) {
-        *first_out = 0;
-        *last_out = UINT16_MAX;
-        return true;
-    }
-    if (container->type == AKLV_ROARING_RUN) {
-        if (container->run_count == 0) {
-            return false;
-        }
-        AklvRoaringRun first = container->runs[0];
-        AklvRoaringRun last = container->runs[container->run_count - 1];
-        *first_out = first.start;
-        *last_out = (uint16_t)((uint32_t)last.start + last.length - 1U);
-        return true;
-    }
-    if (container->bitmap != NULL) {
-        uint16_t first = 0;
-        uint16_t last = 0;
-        bool found = false;
-        for (uint32_t word_i = 0; word_i < 1024; word_i++) {
-            uint64_t word = container->bitmap[word_i];
-            if (word != 0) {
-                first = (uint16_t)((word_i << 6) | (uint32_t)__builtin_ctzll(word));
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            return false;
-        }
-        for (uint32_t word_i = 1024; word_i > 0; word_i--) {
-            uint64_t word = container->bitmap[word_i - 1];
-            if (word != 0) {
-                last = (uint16_t)(((word_i - 1) << 6) | (63U - (uint32_t)__builtin_clzll(word)));
-                break;
-            }
-        }
-        *first_out = first;
-        *last_out = last;
-        return true;
-    }
-    *first_out = container->array[0];
-    *last_out = container->array[container->cardinality - 1];
-    return true;
-}
-
-static AklvContainerRangePlan aklv_container_full_range_fast_plan(const AklvRoaringContainer *container,
-                                                                  uint16_t first_low,
-                                                                  uint16_t last_low) {
-    AklvContainerRangePlan plan;
-    memset(&plan, 0, sizeof(plan));
-    plan.cardinality = container->cardinality;
-    if (container->cardinality == 65536) {
-        plan.type = AKLV_ROARING_FULL;
-        return plan;
-    }
-    uint32_t span = (uint32_t)last_low - (uint32_t)first_low + 1U;
-    size_t run_bytes = sizeof(AklvRoaringRun);
-    size_t current_payload_bytes = 0;
-    switch (container->type) {
-        case AKLV_ROARING_RUN:
-            current_payload_bytes = (size_t)container->run_count * sizeof(*container->runs);
-            break;
-        case AKLV_ROARING_BITMAP:
-            current_payload_bytes = 1024 * sizeof(*container->bitmap);
-            break;
-        case AKLV_ROARING_ARRAY:
-        default:
-            current_payload_bytes = (size_t)container->cardinality * sizeof(*container->array);
-            break;
-    }
-    if (span == container->cardinality && run_bytes <= current_payload_bytes) {
-        plan.type = AKLV_ROARING_RUN;
-        plan.run_count = 1;
-        plan.payload_count = 1;
-        plan.payload_bytes = run_bytes;
-        plan.single_run_start = first_low;
-        plan.single_run_end = last_low;
-        plan.single_run_direct = true;
-        return plan;
-    }
-    plan.type = container->type;
-    plan.full_container_direct = true;
-    switch (container->type) {
-        case AKLV_ROARING_FULL:
-            break;
-        case AKLV_ROARING_RUN:
-            plan.run_count = container->run_count;
-            plan.payload_count = container->run_count;
-            plan.payload_bytes = (size_t)container->run_count * sizeof(*container->runs);
-            break;
-        case AKLV_ROARING_BITMAP:
-            plan.payload_count = 1024;
-            plan.payload_bytes = 1024 * sizeof(*container->bitmap);
-            break;
-        case AKLV_ROARING_ARRAY:
-        default:
-            plan.type = AKLV_ROARING_ARRAY;
-            plan.payload_count = container->cardinality;
-            plan.payload_bytes = (size_t)container->cardinality * sizeof(*container->array);
-            break;
-    }
-    return plan;
-}
-
-static AklvContainerRangePlan aklv_container_complete_fast_plan(const AklvRoaringContainer *container) {
-    AklvContainerRangePlan plan;
-    memset(&plan, 0, sizeof(plan));
-    plan.cardinality = container->cardinality;
-    if (container->cardinality == 0) {
-        plan.type = AKLV_ROARING_ARRAY;
-        return plan;
-    }
-    if (container->cardinality == 65536 || container->type == AKLV_ROARING_FULL) {
-        plan.type = AKLV_ROARING_FULL;
-        return plan;
-    }
-    plan.type = container->type;
-    plan.full_container_direct = true;
-    switch (container->type) {
-        case AKLV_ROARING_RUN:
-            plan.run_count = container->run_count;
-            plan.payload_count = container->run_count;
-            plan.payload_bytes = (size_t)container->run_count * sizeof(*container->runs);
-            break;
-        case AKLV_ROARING_BITMAP:
-            plan.payload_count = 1024;
-            plan.payload_bytes = 1024 * sizeof(*container->bitmap);
-            break;
-        case AKLV_ROARING_ARRAY: {
-            uint16_t first_low = container->array[0];
-            uint16_t last_low = container->array[container->cardinality - 1];
-            uint32_t span = (uint32_t)last_low - (uint32_t)first_low + 1U;
-            size_t array_bytes = (size_t)container->cardinality * sizeof(*container->array);
-            if (span == container->cardinality && sizeof(AklvRoaringRun) <= array_bytes) {
-                plan.type = AKLV_ROARING_RUN;
-                plan.run_count = 1;
-                plan.payload_count = 1;
-                plan.payload_bytes = sizeof(AklvRoaringRun);
-                plan.single_run_start = first_low;
-                plan.single_run_end = last_low;
-                plan.single_run_direct = true;
-                plan.full_container_direct = false;
-            } else {
-                plan.payload_count = container->cardinality;
-                plan.payload_bytes = array_bytes;
-            }
-            break;
-        }
-        case AKLV_ROARING_FULL:
-        default:
-            plan.type = AKLV_ROARING_FULL;
-            plan.full_container_direct = false;
-            break;
-    }
-    return plan;
-}
-
-static AklvContainerRangePlan aklv_container_range_plan(const AklvRoaringContainer *container,
-                                                        uint16_t min_low,
-                                                        uint16_t max_low) {
-    AklvContainerRangePlan plan;
-    memset(&plan, 0, sizeof(plan));
-    if (min_low == 0 && max_low == UINT16_MAX) {
-        return aklv_container_complete_fast_plan(container);
-    }
-    uint16_t first_low = 0;
-    uint16_t last_low = 0;
-    if (aklv_container_first_last_low(container, &first_low, &last_low) &&
-        min_low <= first_low &&
-        max_low >= last_low) {
-        return aklv_container_full_range_fast_plan(container, first_low, last_low);
-    }
-    uint32_t cardinality = 0;
-    uint32_t run_count = 0;
-    aklv_container_range_stats(container, min_low, max_low, &cardinality, &run_count);
-    plan.cardinality = cardinality;
-    plan.run_count = run_count;
-    if (cardinality == 0) {
-        plan.type = AKLV_ROARING_ARRAY;
-        return plan;
-    }
-    if (cardinality == 65536) {
-        plan.type = AKLV_ROARING_FULL;
-        return plan;
-    }
-
-    size_t array_bytes = (size_t)cardinality * sizeof(uint16_t);
-    size_t run_bytes = run_count == 0 ? SIZE_MAX : (size_t)run_count * sizeof(AklvRoaringRun);
-    size_t bitmap_bytes = 1024 * sizeof(uint64_t);
-    if (run_bytes <= array_bytes && run_bytes <= bitmap_bytes) {
-        plan.type = AKLV_ROARING_RUN;
-        plan.payload_count = run_count;
-        plan.payload_bytes = run_bytes;
-    } else if (bitmap_bytes < array_bytes) {
-        plan.type = AKLV_ROARING_BITMAP;
-        plan.payload_count = 1024;
-        plan.payload_bytes = bitmap_bytes;
-    } else {
-        plan.type = AKLV_ROARING_ARRAY;
-        plan.payload_count = cardinality;
-        plan.payload_bytes = array_bytes;
-    }
-    return plan;
-}
-
-static AklvCachePostingRangePlan aklv_cache_plan_posting_range(const AklvGramPosting *posting,
-                                                               uint64_t first_line,
-                                                               uint64_t last_line,
-                                                               AklvCacheContainerWritePlan *container_plans,
-                                                               uint32_t container_plan_capacity) {
-    AklvCachePostingRangePlan posting_plan;
-    memset(&posting_plan, 0, sizeof(posting_plan));
-    uint64_t first_key = first_line >> 16;
-    uint64_t last_key = last_line >> 16;
-    uint64_t first_container =
-        aklv_roaring_lower_bound_container_index(&posting->lines, first_key);
-    for (uint64_t i = first_container; i < posting->lines.count; i++) {
-        const AklvRoaringContainer *container = &posting->lines.containers[i];
-        if (container->key > last_key) {
-            break;
-        }
-        uint16_t min_low = container->key == first_key ? (uint16_t)(first_line & 0xffffU) : 0;
-        uint16_t max_low = container->key == last_key ? (uint16_t)(last_line & 0xffffU) : UINT16_MAX;
-        AklvContainerRangePlan plan =
-            aklv_container_range_plan(container, min_low, max_low);
-        if (plan.cardinality == 0) {
-            continue;
-        }
-        if (posting_plan.container_count == container_plan_capacity) {
-            posting_plan.container_count = UINT32_MAX;
-            posting_plan.serialized_bytes = UINT64_MAX;
-            return posting_plan;
-        }
-        AklvCacheContainerWritePlan *write_plan = &container_plans[posting_plan.container_count++];
-        write_plan->container = container;
-        write_plan->plan = plan;
-        write_plan->min_low = min_low;
-        write_plan->max_low = max_low;
-        posting_plan.cardinality += plan.cardinality;
-        uint64_t bytes = sizeof(AklvIndexCacheContainerHeader) + (uint64_t)plan.payload_bytes;
-        posting_plan.serialized_bytes = aklv_cache_saturating_add_u64(posting_plan.serialized_bytes, bytes);
-        posting_plan.payload_bytes =
-            aklv_cache_saturating_add_u64(posting_plan.payload_bytes, (uint64_t)plan.payload_bytes);
-    }
-    if (posting_plan.container_count != 0) {
-        posting_plan.serialized_bytes =
-            aklv_cache_saturating_add_u64(posting_plan.serialized_bytes,
-                                          sizeof(AklvIndexCachePostingHeader));
-    }
-    return posting_plan;
-}
-
 static bool aklv_cache_write_padding(FILE *stream, size_t bytes) {
     static const unsigned char zeroes[256] = {0};
     while (bytes > 0) {
@@ -1792,31 +1436,6 @@ static bool aklv_cache_write_padding(FILE *stream, size_t bytes) {
         bytes -= chunk;
     }
     return true;
-}
-
-static bool aklv_cache_write_u16_sequence(FILE *stream,
-                                          AklvCacheWriteScratch *scratch,
-                                          uint32_t first,
-                                          uint32_t last) {
-    if (scratch == NULL || scratch->u16_values == NULL) {
-        return false;
-    }
-    bool ok = true;
-    while (ok && first <= last) {
-        uint32_t remaining = last - first + 1U;
-        size_t count = remaining > AKLV_CACHE_U16_WRITE_BATCH
-            ? AKLV_CACHE_U16_WRITE_BATCH
-            : (size_t)remaining;
-        for (size_t i = 0; i < count; i++) {
-            scratch->u16_values[i] = (uint16_t)(first + (uint32_t)i);
-        }
-        if (!aklv_write_all(stream, scratch->u16_values, count * sizeof(*scratch->u16_values))) {
-            ok = false;
-            break;
-        }
-        first += (uint32_t)count;
-    }
-    return ok;
 }
 
 static uint32_t aklv_lower_bound_u16(const uint16_t *items, uint32_t count, uint16_t value) {
@@ -1833,56 +1452,70 @@ static uint32_t aklv_lower_bound_u16(const uint16_t *items, uint32_t count, uint
     return lo;
 }
 
-static bool aklv_cache_flush_u16_batch(FILE *stream, uint16_t *values, size_t *count) {
-    if (*count == 0) {
-        return true;
+static uint64_t aklv_cache_container_payload_bytes(const AklvRoaringContainer *container) {
+    if (container == NULL || container->cardinality == 0) {
+        return 0;
     }
-    bool ok = aklv_write_all(stream, values, *count * sizeof(*values));
-    *count = 0;
-    return ok;
+    switch (container->type) {
+        case AKLV_ROARING_FULL:
+            return 0;
+        case AKLV_ROARING_RUN:
+            return (uint64_t)container->run_count * sizeof(*container->runs);
+        case AKLV_ROARING_BITMAP:
+            return 1024U * sizeof(*container->bitmap);
+        case AKLV_ROARING_ARRAY:
+        default:
+            return (uint64_t)container->cardinality * sizeof(*container->array);
+    }
 }
 
-static bool aklv_cache_append_u16(FILE *stream, uint16_t *values, size_t *count, uint16_t value) {
-    values[(*count)++] = value;
-    if (*count == AKLV_CACHE_U16_WRITE_BATCH) {
-        return aklv_cache_flush_u16_batch(stream, values, count);
+static uint32_t aklv_cache_container_payload_count(const AklvRoaringContainer *container) {
+    if (container == NULL || container->cardinality == 0) {
+        return 0;
+    }
+    switch (container->type) {
+        case AKLV_ROARING_FULL:
+            return 0;
+        case AKLV_ROARING_RUN:
+            return container->run_count;
+        case AKLV_ROARING_BITMAP:
+            return 1024;
+        case AKLV_ROARING_ARRAY:
+        default:
+            return container->cardinality;
+    }
+}
+
+static bool aklv_cache_write_offset_range(FILE *stream,
+                                          const AklvLineIndex *index,
+                                          uint64_t first_line,
+                                          uint64_t last_line,
+                                          uint64_t *values) {
+    if (values == NULL) {
+        return false;
+    }
+    bool done = false;
+    while (!done && first_line <= last_line) {
+        size_t count = 0;
+        while (count < AKLV_CACHE_OFFSET_CONVERT_BATCH && first_line <= last_line) {
+            uint64_t pos = first_line - 1;
+            size_t packed = index->offset_blocks[pos >> AKLV_LINE_INDEX_BLOCK_SHIFT]
+                                                [pos & AKLV_LINE_INDEX_BLOCK_MASK];
+            values[count++] = (uint64_t)packed;
+            if (first_line == last_line || first_line == UINT64_MAX) {
+                done = true;
+                break;
+            }
+            first_line++;
+        }
+        if (!aklv_write_all(stream, values, count * sizeof(*values))) {
+            return false;
+        }
     }
     return true;
 }
 
-static bool aklv_cache_flush_run_batch(FILE *stream, AklvRoaringRun *runs, size_t *count) {
-    if (*count == 0) {
-        return true;
-    }
-    bool ok = aklv_write_all(stream, runs, *count * sizeof(*runs));
-    *count = 0;
-    return ok;
-}
-
-static bool aklv_cache_append_run(FILE *stream,
-                                  AklvRoaringRun *runs,
-                                  size_t *count,
-                                  uint32_t start,
-                                  uint32_t end) {
-    AklvRoaringRun run;
-    run.start = (uint16_t)start;
-    run.length = (uint16_t)(end - start + 1U);
-    runs[(*count)++] = run;
-    if (*count == AKLV_CACHE_RUN_WRITE_BATCH) {
-        return aklv_cache_flush_run_batch(stream, runs, count);
-    }
-    return true;
-}
-
-static bool aklv_cache_write_single_run(FILE *stream, uint16_t start, uint16_t end) {
-    AklvRoaringRun run;
-    run.start = start;
-    run.length = (uint16_t)((uint32_t)end - (uint32_t)start + 1U);
-    return aklv_write_all(stream, &run, sizeof(run));
-}
-
-static bool aklv_cache_write_full_container_payload(FILE *stream,
-                                                    const AklvRoaringContainer *container) {
+static bool aklv_cache_write_container_payload(FILE *stream, const AklvRoaringContainer *container) {
     switch (container->type) {
         case AKLV_ROARING_FULL:
             return true;
@@ -1900,616 +1533,37 @@ static bool aklv_cache_write_full_container_payload(FILE *stream,
     }
 }
 
-static bool aklv_cache_write_container_array_range(FILE *stream,
-                                                   AklvCacheWriteScratch *scratch,
-                                                   const AklvRoaringContainer *container,
-                                                   uint16_t min_low,
-                                                   uint16_t max_low) {
-    if (scratch == NULL || scratch->u16_values == NULL) {
-        return false;
-    }
-    if (container->type == AKLV_ROARING_FULL) {
-        return aklv_cache_write_u16_sequence(stream, scratch, min_low, max_low);
-    }
-    if (container->type == AKLV_ROARING_RUN) {
-        for (uint32_t i = 0; i < container->run_count; i++) {
-            uint32_t start = container->runs[i].start;
-            uint32_t end = start + container->runs[i].length - 1U;
-            if (end < min_low) {
-                continue;
-            }
-            if (start > max_low) {
-                break;
-            }
-            if (start < min_low) {
-                start = min_low;
-            }
-            if (end > max_low) {
-                end = max_low;
-            }
-            if (!aklv_cache_write_u16_sequence(stream, scratch, start, end)) {
-                return false;
-            }
-        }
-        return true;
-    }
-    if (container->bitmap != NULL) {
-        size_t value_count = 0;
-        uint32_t first_word = min_low >> 6;
-        uint32_t last_word = max_low >> 6;
-        for (uint32_t word_i = first_word; word_i <= last_word; word_i++) {
-            uint64_t bits = container->bitmap[word_i];
-            if (word_i == first_word) {
-                uint32_t skip = min_low & 63U;
-                if (skip != 0) {
-                    bits &= UINT64_MAX << skip;
-                }
-            }
-            if (word_i == last_word) {
-                uint32_t keep = (max_low & 63U) + 1U;
-                if (keep < 64U) {
-                    bits &= (UINT64_C(1) << keep) - 1U;
-                }
-            }
-            while (bits != 0) {
-                uint32_t bit = (uint32_t)__builtin_ctzll(bits);
-                bits &= bits - 1;
-                uint16_t value = (uint16_t)((word_i << 6) | bit);
-                if (!aklv_cache_append_u16(stream, scratch->u16_values, &value_count, value)) {
-                    return false;
-                }
-            }
-            if (word_i == UINT32_MAX) {
-                break;
-            }
-        }
-        return aklv_cache_flush_u16_batch(stream, scratch->u16_values, &value_count);
-    }
-    uint32_t begin = aklv_lower_bound_u16(container->array, container->cardinality, min_low);
-    uint32_t end = max_low == UINT16_MAX
-        ? container->cardinality
-        : aklv_lower_bound_u16(container->array, container->cardinality, (uint16_t)(max_low + 1U));
-    return begin >= end ||
-           aklv_write_all(stream,
-                          container->array + begin,
-                          (size_t)(end - begin) * sizeof(*container->array));
-}
-
-static bool aklv_cache_write_container_runs_range(FILE *stream,
-                                                  AklvCacheWriteScratch *scratch,
-                                                  const AklvRoaringContainer *container,
-                                                  uint16_t min_low,
-                                                  uint16_t max_low) {
-    if (scratch == NULL || scratch->runs == NULL) {
-        return false;
-    }
-    if (container->type == AKLV_ROARING_FULL) {
-        AklvRoaringRun current = {0};
-        current.start = min_low;
-        current.length = (uint16_t)((uint32_t)max_low - (uint32_t)min_low + 1U);
-        return aklv_write_all(stream, &current, sizeof(current));
-    }
-    if (container->type == AKLV_ROARING_RUN) {
-        size_t run_count = 0;
-        for (uint32_t i = 0; i < container->run_count; i++) {
-            uint32_t start = container->runs[i].start;
-            uint32_t end = start + container->runs[i].length - 1U;
-            if (end < min_low) {
-                continue;
-            }
-            if (start > max_low) {
-                break;
-            }
-            if (start < min_low) {
-                start = min_low;
-            }
-            if (end > max_low) {
-                end = max_low;
-            }
-            if (!aklv_cache_append_run(stream, scratch->runs, &run_count, start, end)) {
-                return false;
-            }
-        }
-        return aklv_cache_flush_run_batch(stream, scratch->runs, &run_count);
+static int aklv_index_cache_write_file(const char *path,
+                                       AklvLineIndex *index,
+                                       AklvIndexCache *cache,
+                                       const char hash[33],
+                                       char *error,
+                                       size_t error_cap) {
+    AklvCacheFileIdentity identity;
+    memset(&identity, 0, sizeof(identity));
+    if (!aklv_file_stat_identity(path, &identity.file_size, &identity.mtime_sec, &identity.mtime_nsec)) {
+        aklv_set_error(error, error_cap, "stat file failed before cache store: %s: %s", path, strerror(errno));
+        return -1;
     }
 
-    size_t run_batch_count = 0;
-    AklvRoaringRun current = {0};
-    bool in_run = false;
-    uint32_t prev = 0;
-    if (container->bitmap != NULL) {
-        uint32_t first_word = min_low >> 6;
-        uint32_t last_word = max_low >> 6;
-        for (uint32_t word_i = first_word; word_i <= last_word; word_i++) {
-            uint64_t bits = container->bitmap[word_i];
-            if (word_i == first_word) {
-                uint32_t skip = min_low & 63U;
-                if (skip != 0) {
-                    bits &= UINT64_MAX << skip;
-                }
-            }
-            if (word_i == last_word) {
-                uint32_t keep = (max_low & 63U) + 1U;
-                if (keep < 64U) {
-                    bits &= (UINT64_C(1) << keep) - 1U;
-                }
-            }
-            while (bits != 0) {
-                uint32_t bit = (uint32_t)__builtin_ctzll(bits);
-                bits &= bits - 1;
-                uint32_t low = (word_i << 6) | bit;
-                if (!in_run) {
-                    current.start = (uint16_t)low;
-                    in_run = true;
-                } else if (low != prev + 1U) {
-                    if (!aklv_cache_append_run(stream,
-                                               scratch->runs,
-                                               &run_batch_count,
-                                               current.start,
-                                               prev)) {
-                        return false;
-                    }
-                    current.start = (uint16_t)low;
-                }
-                prev = low;
-            }
-        }
-    } else {
-        uint32_t begin = aklv_lower_bound_u16(container->array, container->cardinality, min_low);
-        uint32_t end = max_low == UINT16_MAX
-            ? container->cardinality
-            : aklv_lower_bound_u16(container->array,
-                                   container->cardinality,
-                                   (uint16_t)(max_low + 1U));
-        for (uint32_t i = begin; i < end; i++) {
-            uint32_t low = container->array[i];
-            if (!in_run) {
-                current.start = (uint16_t)low;
-                in_run = true;
-            } else if (low != prev + 1U) {
-                if (!aklv_cache_append_run(stream,
-                                           scratch->runs,
-                                           &run_batch_count,
-                                           current.start,
-                                           prev)) {
-                    return false;
-                }
-                current.start = (uint16_t)low;
-            }
-            prev = low;
-        }
-    }
-    if (in_run) {
-        if (!aklv_cache_append_run(stream, scratch->runs, &run_batch_count, current.start, prev)) {
-            return false;
-        }
-    }
-    return aklv_cache_flush_run_batch(stream, scratch->runs, &run_batch_count);
-}
-
-static bool aklv_cache_write_container_bitmap_range(FILE *stream,
-                                                    const AklvRoaringContainer *container,
-                                                    uint16_t min_low,
-                                                    uint16_t max_low) {
-    if (container->bitmap != NULL && min_low == 0 && max_low == UINT16_MAX) {
-        return aklv_write_all(stream, container->bitmap, 1024 * sizeof(*container->bitmap));
-    }
-    uint64_t words[1024];
-    memset(words, 0, sizeof(words));
-    if (container->type == AKLV_ROARING_FULL) {
-        for (uint32_t word_i = 0; word_i < 1024; word_i++) {
-            words[word_i] = UINT64_MAX;
-        }
-    } else if (container->bitmap != NULL) {
-        memcpy(words, container->bitmap, sizeof(words));
-    } else if (container->type == AKLV_ROARING_RUN) {
-        for (uint32_t i = 0; i < container->run_count; i++) {
-            uint32_t start = container->runs[i].start;
-            uint32_t end = start + container->runs[i].length - 1U;
-            if (end < min_low) {
-                continue;
-            }
-            if (start > max_low) {
-                break;
-            }
-            if (start < min_low) {
-                start = min_low;
-            }
-            if (end > max_low) {
-                end = max_low;
-            }
-            uint32_t first_word = start >> 6;
-            uint32_t last_word = end >> 6;
-            for (uint32_t word_i = first_word; word_i <= last_word; word_i++) {
-                uint32_t word_start = word_i << 6;
-                uint32_t word_end = word_start + 63U;
-                uint32_t lo = start > word_start ? start : word_start;
-                uint32_t hi = end < word_end ? end : word_end;
-                words[word_i] |= aklv_bit_range_mask(lo & 63U, hi & 63U);
-            }
-        }
-    } else {
-        for (uint32_t i = 0; i < container->cardinality; i++) {
-            uint16_t low = container->array[i];
-            words[low >> 6] |= UINT64_C(1) << (low & 63U);
-        }
-    }
-    for (uint32_t word_i = 0; word_i < 1024; word_i++) {
-        uint32_t word_start = word_i << 6;
-        uint32_t word_end = word_start + 63U;
-        if (word_end < min_low || word_start > max_low) {
-            words[word_i] = 0;
-            continue;
-        }
-        if (word_start < min_low) {
-            uint32_t skip = min_low & 63U;
-            if (skip != 0) {
-                words[word_i] &= UINT64_MAX << skip;
-            }
-        }
-        if (word_end > max_low) {
-            uint32_t keep = (max_low & 63U) + 1U;
-            if (keep < 64U) {
-                words[word_i] &= (UINT64_C(1) << keep) - 1U;
-            }
-        }
-    }
-    return aklv_write_all(stream, words, sizeof(words));
-}
-
-static bool aklv_cache_write_container_range(FILE *stream,
-                                             AklvCacheWriteScratch *scratch,
-                                             const AklvRoaringContainer *container,
-                                             uint16_t min_low,
-                                             uint16_t max_low,
-                                             AklvContainerRangePlan plan) {
-    if (plan.cardinality == 0) {
-        return true;
-    }
-    AklvIndexCacheContainerHeader header;
+    AklvIndexCacheFileHeader header;
     memset(&header, 0, sizeof(header));
-    header.key = container->key;
-    header.cardinality = plan.cardinality;
-    header.type = (uint32_t)plan.type;
-    header.payload_count = plan.payload_count;
-    if (!aklv_write_all(stream, &header, sizeof(header))) {
-        return false;
-    }
-    if (plan.full_container_direct && plan.type == container->type) {
-        return aklv_cache_write_full_container_payload(stream, container);
-    }
-    switch (plan.type) {
-        case AKLV_ROARING_FULL:
-            return true;
-        case AKLV_ROARING_RUN:
-            if (plan.single_run_direct) {
-                return aklv_cache_write_single_run(stream,
-                                                   plan.single_run_start,
-                                                   plan.single_run_end);
-            }
-            return aklv_cache_write_container_runs_range(stream, scratch, container, min_low, max_low);
-        case AKLV_ROARING_BITMAP:
-            return aklv_cache_write_container_bitmap_range(stream, container, min_low, max_low);
-        case AKLV_ROARING_ARRAY:
-            return aklv_cache_write_container_array_range(stream, scratch, container, min_low, max_low);
-        default:
-            return false;
-    }
-}
+    memcpy(header.magic, AKLV_INDEX_CACHE_MAGIC, sizeof(header.magic));
+    header.version = AKLV_INDEX_CACHE_VERSION;
+    header.file_size = identity.file_size;
+    header.file_mtime_sec = identity.mtime_sec;
+    header.file_mtime_nsec = identity.mtime_nsec;
+    header.line_count = index->count;
+    header.first_line = index->count == 0 ? 0 : 1;
+    header.last_line = index->count;
+    header.offset_count = index->count;
+    header.gram_count = index->gram_index.count;
+    header.gram_size = AKLV_ASCII_GRAM_MAX_SIZE;
 
-static bool aklv_cache_write_posting_range(FILE *stream,
-                                           AklvCacheWriteScratch *scratch,
-                                           const AklvGramPosting *posting,
-                                           const AklvCacheContainerWritePlan *container_plans,
-                                           AklvCachePostingRangePlan plan) {
-    if (plan.container_count == 0) {
-        return true;
-    }
-    AklvIndexCachePostingHeader header;
-    memset(&header, 0, sizeof(header));
-    header.gram = posting->gram;
-    header.container_count = plan.container_count;
-    header.cardinality = plan.cardinality;
-    if (!aklv_write_all(stream, &header, sizeof(header))) {
-        return false;
-    }
-    for (uint32_t i = 0; i < plan.container_count; i++) {
-        const AklvCacheContainerWritePlan *write_plan = &container_plans[i];
-        if (!aklv_cache_write_container_range(stream,
-                                              scratch,
-                                              write_plan->container,
-                                              write_plan->min_low,
-                                              write_plan->max_low,
-                                              write_plan->plan)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool aklv_cache_collect_all_postings(const AklvGramIndex *gram_index,
-                                            AklvGramPosting ***out_postings,
-                                            uint64_t *out_count) {
-    *out_postings = NULL;
-    *out_count = 0;
-    if (gram_index->count == 0) {
-        return true;
-    }
-    if (gram_index->count > (uint64_t)(SIZE_MAX / sizeof(AklvGramPosting *))) {
-        return false;
-    }
-    AklvGramPosting **postings = malloc((size_t)gram_index->count * sizeof(*postings));
-    if (postings == NULL) {
-        return false;
-    }
-    uint64_t count = 0;
-    for (uint64_t i = 0; i < gram_index->count; i++) {
-        uint64_t slot = gram_index->used_slots[i];
-        AklvGramPosting *posting = &gram_index->items[slot];
-        if (!posting->used || posting->lines.count == 0) {
-            continue;
-        }
-        postings[count++] = posting;
-    }
-    *out_postings = postings;
-    *out_count = count;
-    return true;
-}
-
-static uint64_t aklv_cache_saturating_add_u64(uint64_t value, uint64_t add) {
-    if (UINT64_MAX - value < add) {
-        return UINT64_MAX;
-    }
-    return value + add;
-}
-
-static uint64_t aklv_cache_key_first_line(uint64_t key) {
-    return key == 0 ? 1 : (key << 16);
-}
-
-static uint64_t aklv_cache_key_last_line(uint64_t key, uint64_t line_count) {
-    uint64_t last = UINT64_MAX;
-    if (key < (UINT64_MAX >> 16)) {
-        last = ((key + 1) << 16) - 1;
-    }
-    return last > line_count ? line_count : last;
-}
-
-static uint64_t aklv_cache_container_estimated_payload_bytes(const AklvRoaringContainer *container) {
-    if (container->cardinality == 0) {
-        return 0;
-    }
-    switch (container->type) {
-        case AKLV_ROARING_FULL:
-            return 0;
-        case AKLV_ROARING_RUN:
-            return (uint64_t)container->run_count * sizeof(*container->runs);
-        case AKLV_ROARING_BITMAP:
-            return 1024 * sizeof(*container->bitmap);
-        case AKLV_ROARING_ARRAY:
-        default:
-            return (uint64_t)container->cardinality * sizeof(uint16_t);
-    }
-}
-
-static void aklv_cache_key_plan_destroy(AklvCacheKeyPlan *plan) {
-    if (plan == NULL) {
-        return;
-    }
-    free(plan->key_bytes);
-    free(plan->bucket_offsets);
-    free(plan->posting_indices);
-    memset(plan, 0, sizeof(*plan));
-}
-
-static void aklv_cache_write_scratch_destroy(AklvCacheWriteScratch *scratch) {
-    if (scratch == NULL) {
-        return;
-    }
-    free(scratch->u16_values);
-    free(scratch->runs);
-    free(scratch->offset_values);
-    memset(scratch, 0, sizeof(*scratch));
-}
-
-static bool aklv_cache_write_scratch_init(AklvCacheWriteScratch *scratch) {
-    if (scratch == NULL) {
-        return false;
-    }
-    memset(scratch, 0, sizeof(*scratch));
-    scratch->u16_values = malloc((size_t)AKLV_CACHE_U16_WRITE_BATCH * sizeof(*scratch->u16_values));
-    scratch->runs = malloc((size_t)AKLV_CACHE_RUN_WRITE_BATCH * sizeof(*scratch->runs));
-    scratch->offset_values =
-        malloc((size_t)AKLV_CACHE_OFFSET_CONVERT_BATCH * sizeof(*scratch->offset_values));
-    if (scratch->u16_values == NULL || scratch->runs == NULL || scratch->offset_values == NULL) {
-        aklv_cache_write_scratch_destroy(scratch);
-        return false;
-    }
-    return true;
-}
-
-static bool aklv_cache_build_key_plan(const AklvLineIndex *index,
-                                      AklvGramPosting *const *postings,
-                                      uint64_t posting_count,
-                                      AklvCacheKeyPlan *plan) {
-    memset(plan, 0, sizeof(*plan));
-    if (index->count == 0) {
-        return true;
-    }
-    uint64_t key_count = (index->count >> 16) + 1;
-    if (key_count > (uint64_t)(SIZE_MAX / sizeof(uint64_t)) ||
-        key_count + 1 < key_count ||
-        key_count + 1 > (uint64_t)(SIZE_MAX / sizeof(uint64_t))) {
-        return false;
-    }
-    uint64_t *key_bytes = calloc((size_t)key_count, sizeof(*key_bytes));
-    if (key_bytes == NULL) {
-        return false;
-    }
-
-    for (uint64_t key = 0; key < key_count; key++) {
-        uint64_t first_line = aklv_cache_key_first_line(key);
-        uint64_t last_line = aklv_cache_key_last_line(key, index->count);
-        if (first_line > last_line) {
-            continue;
-        }
-        uint64_t line_count = last_line - first_line + 1;
-        key_bytes[key] = aklv_cache_saturating_add_u64(key_bytes[key],
-                                                       line_count * sizeof(uint64_t));
-    }
-
-    for (uint64_t i = 0; i < posting_count; i++) {
-        const AklvGramPosting *posting = postings[i];
-        for (uint64_t c = 0; c < posting->lines.count; c++) {
-            const AklvRoaringContainer *container = &posting->lines.containers[c];
-            if (container->key >= key_count) {
-                continue;
-            }
-            if (container->cardinality == 0) {
-                continue;
-            }
-            uint64_t payload_bytes = aklv_cache_container_estimated_payload_bytes(container);
-            uint64_t bytes = sizeof(AklvIndexCachePostingHeader) +
-                             sizeof(AklvIndexCacheContainerHeader) +
-                             payload_bytes;
-            key_bytes[container->key] =
-                aklv_cache_saturating_add_u64(key_bytes[container->key], bytes);
-        }
-    }
-
-    plan->key_bytes = key_bytes;
-    plan->key_count = key_count;
-    return true;
-}
-
-static bool aklv_cache_build_posting_buckets(AklvCacheKeyPlan *plan,
-                                             AklvGramPosting *const *postings,
-                                             uint64_t posting_count) {
-    if (plan->bucket_offsets != NULL || plan->key_count == 0) {
-        return true;
-    }
-    if (posting_count > UINT32_MAX ||
-        plan->key_count + 1 < plan->key_count ||
-        plan->key_count + 1 > (uint64_t)(SIZE_MAX / sizeof(uint64_t))) {
-        return false;
-    }
-    uint64_t *bucket_counts = calloc((size_t)(plan->key_count + 1), sizeof(*bucket_counts));
-    if (bucket_counts == NULL) {
-        return false;
-    }
-    for (uint64_t i = 0; i < posting_count; i++) {
-        const AklvGramPosting *posting = postings[i];
-        for (uint64_t c = 0; c < posting->lines.count; c++) {
-            const AklvRoaringContainer *container = &posting->lines.containers[c];
-            if (container->key < plan->key_count && container->cardinality != 0) {
-                bucket_counts[container->key + 1]++;
-            }
-        }
-    }
-
-    uint64_t posting_index_count = 0;
-    for (uint64_t key = 0; key < plan->key_count; key++) {
-        uint64_t count = bucket_counts[key + 1];
-        if (count > UINT64_MAX - posting_index_count) {
-            free(bucket_counts);
-            return false;
-        }
-        bucket_counts[key] = posting_index_count;
-        posting_index_count += count;
-    }
-    bucket_counts[plan->key_count] = posting_index_count;
-    if (posting_index_count > (uint64_t)(SIZE_MAX / sizeof(uint32_t)) ||
-        posting_count > UINT32_MAX) {
-        free(bucket_counts);
-        return false;
-    }
-    uint32_t *posting_indices = NULL;
-    if (posting_index_count != 0) {
-        posting_indices = malloc((size_t)posting_index_count * sizeof(*posting_indices));
-        if (posting_indices == NULL) {
-            free(bucket_counts);
-            return false;
-        }
-    }
-    uint64_t *write_offsets = calloc((size_t)plan->key_count, sizeof(*write_offsets));
-    if (write_offsets == NULL) {
-        free(posting_indices);
-        free(bucket_counts);
-        return false;
-    }
-    memcpy(write_offsets, bucket_counts, (size_t)plan->key_count * sizeof(*write_offsets));
-    for (uint64_t i = 0; i < posting_count; i++) {
-        const AklvGramPosting *posting = postings[i];
-        for (uint64_t c = 0; c < posting->lines.count; c++) {
-            const AklvRoaringContainer *container = &posting->lines.containers[c];
-            if (container->key >= plan->key_count || container->cardinality == 0) {
-                continue;
-            }
-            posting_indices[write_offsets[container->key]++] = (uint32_t)i;
-        }
-    }
-    free(write_offsets);
-
-    plan->bucket_offsets = bucket_counts;
-    plan->posting_indices = posting_indices;
-    plan->posting_index_count = posting_index_count;
-    return true;
-}
-
-static bool aklv_cache_write_offset_range(FILE *stream,
-                                          AklvCacheWriteScratch *scratch,
-                                          const AklvLineIndex *index,
-                                          uint64_t first_line,
-                                          uint64_t last_line) {
-    if (scratch == NULL || scratch->offset_values == NULL) {
-        return false;
-    }
-    bool done = false;
-    bool ok = true;
-    while (ok && !done && first_line <= last_line) {
-        size_t count = 0;
-        while (count < AKLV_CACHE_OFFSET_CONVERT_BATCH && first_line <= last_line) {
-            uint64_t pos = first_line - 1;
-            size_t packed = index->offset_blocks[pos >> AKLV_LINE_INDEX_BLOCK_SHIFT]
-                                                [pos & AKLV_LINE_INDEX_BLOCK_MASK];
-            scratch->offset_values[count++] = (uint64_t)packed;
-            if (first_line == last_line || first_line == UINT64_MAX) {
-                done = true;
-                break;
-            }
-            first_line++;
-        }
-        if (!aklv_write_all(stream, scratch->offset_values, count * sizeof(*scratch->offset_values))) {
-            ok = false;
-            break;
-        }
-    }
-    return ok;
-}
-
-static bool aklv_cache_write_shard(const AklvCacheFileIdentity *identity,
-                                   AklvLineIndex *index,
-                                   AklvIndexCache *cache,
-                                   const char hash[33],
-                                   AklvGramPosting *const *postings,
-                                   uint64_t all_posting_count,
-                                   const AklvCacheKeyPlan *key_plan,
-                                   AklvCacheContainerWritePlan *container_plans,
-                                   AklvCacheWriteScratch *scratch,
-                                   uint32_t container_plan_capacity,
-                                   uint32_t *posting_marks,
-                                   uint32_t *shard_posting_indices,
-                                   uint32_t posting_mark,
-                                   unsigned char *stream_buffer,
-                                   uint32_t shard_index,
-                                   uint64_t first_line,
-                                   uint64_t last_line,
-                                   char *error,
-                                   size_t error_cap) {
-    char *cache_path = aklv_index_cache_path_for(hash, shard_index);
+    char *cache_path = aklv_index_cache_path_for(hash);
     if (cache_path == NULL) {
         aklv_set_error(error, error_cap, "failed to allocate cache path");
-        return false;
+        return -1;
     }
     char tmp_path[PATH_MAX];
     uint64_t tmp_id = atomic_fetch_add_explicit(&g_aklv_cache_tmp_counter, 1, memory_order_relaxed);
@@ -2520,302 +1574,120 @@ static bool aklv_cache_write_shard(const AklvCacheFileIdentity *identity,
                            (long)getpid(),
                            tmp_id);
     if (tmp_len < 0 || (size_t)tmp_len >= sizeof(tmp_path)) {
-        aklv_set_error(error, error_cap, "cache temp path too long: %s", cache_path);
         free(cache_path);
-        return false;
+        aklv_set_error(error, error_cap, "cache temp path too long");
+        return -1;
     }
+
+    int rc = -1;
+    unsigned char *stream_buffer = NULL;
+    uint64_t *offset_values = NULL;
     FILE *stream = fopen(tmp_path, "wb");
     if (stream == NULL) {
         aklv_set_error(error, error_cap, "open cache file failed: %s: %s", tmp_path, strerror(errno));
-        free(cache_path);
-        return false;
+        goto done;
     }
+    stream_buffer = malloc(AKLV_CACHE_STREAM_BUFFER_BYTES);
     if (stream_buffer != NULL) {
         setvbuf(stream, (char *)stream_buffer, _IOFBF, AKLV_CACHE_STREAM_BUFFER_BYTES);
     }
-
-    AklvIndexCacheFileHeader header;
-    memset(&header, 0, sizeof(header));
-    memcpy(header.magic, AKLV_INDEX_CACHE_MAGIC, sizeof(header.magic));
-    header.version = AKLV_INDEX_CACHE_VERSION;
-    header.shard_index = shard_index;
-    header.file_size = identity->file_size;
-    header.file_mtime_sec = identity->mtime_sec;
-    header.file_mtime_nsec = identity->mtime_nsec;
-    header.line_count = index->count;
-    header.first_line = first_line;
-    header.last_line = last_line;
-    header.offset_count = last_line >= first_line ? last_line - first_line + 1 : 0;
-    header.gram_size = AKLV_ASCII_GRAM_MAX_SIZE;
+    offset_values = malloc((size_t)AKLV_CACHE_OFFSET_CONVERT_BATCH * sizeof(*offset_values));
+    if (offset_values == NULL) {
+        aklv_set_error(error, error_cap, "failed to allocate cache offset write buffer");
+        goto done;
+    }
 
     bool ok = aklv_write_all(stream, &header, sizeof(header)) &&
               aklv_cache_write_padding(stream, AKLV_INDEX_CACHE_HEADER_SIZE - sizeof(header)) &&
-              aklv_cache_write_offset_range(stream, scratch, index, first_line, last_line);
-    uint64_t shard_posting_count = 0;
-    bool whole_index_shard = first_line == 1 && last_line >= index->count;
-    if (ok && !whole_index_shard &&
-        key_plan->key_count != 0 && posting_marks != NULL && shard_posting_indices != NULL) {
-        uint64_t first_key = first_line >> 16;
-        uint64_t last_key = last_line >> 16;
-        if (last_key >= key_plan->key_count) {
-            last_key = key_plan->key_count - 1;
-        }
-        for (uint64_t key = first_key; key <= last_key; key++) {
-            for (uint64_t i = key_plan->bucket_offsets[key]; i < key_plan->bucket_offsets[key + 1]; i++) {
-                uint32_t posting_index = key_plan->posting_indices[i];
-                if (posting_marks[posting_index] == posting_mark) {
-                    continue;
-                }
-                posting_marks[posting_index] = posting_mark;
-                shard_posting_indices[shard_posting_count++] = posting_index;
-            }
-            if (key == UINT64_MAX) {
-                break;
-            }
-        }
-    }
-    uint64_t write_posting_count = whole_index_shard ? all_posting_count : shard_posting_count;
-    for (uint64_t i = 0; ok && i < write_posting_count; i++) {
-        AklvGramPosting *posting = whole_index_shard ? postings[i] : postings[shard_posting_indices[i]];
-        AklvCachePostingRangePlan plan =
-            aklv_cache_plan_posting_range(posting,
-                                          first_line,
-                                          last_line,
-                                          container_plans,
-                                          container_plan_capacity);
-        if (plan.container_count == UINT32_MAX ||
-            plan.serialized_bytes == UINT64_MAX ||
-            plan.payload_bytes == UINT64_MAX) {
+              aklv_cache_write_offset_range(stream, index, 1, index->count, offset_values);
+    uint64_t written_postings = 0;
+    for (uint64_t i = 0; ok && i < index->gram_index.count; i++) {
+        uint64_t slot = index->gram_index.used_slots[i];
+        if (slot >= index->gram_index.capacity) {
             ok = false;
             break;
         }
-        if (plan.container_count != 0 && plan.serialized_bytes != 0) {
-            if (plan.container_count > UINT32_MAX - header.total_container_count) {
+        AklvGramPosting *posting = &index->gram_index.items[slot];
+        if (!posting->used || posting->lines.count == 0) {
+            continue;
+        }
+        if (posting->lines.count > UINT32_MAX - header.total_container_count) {
+            ok = false;
+            break;
+        }
+        written_postings++;
+        header.total_container_count += (uint32_t)posting->lines.count;
+        AklvIndexCachePostingHeader posting_header;
+        memset(&posting_header, 0, sizeof(posting_header));
+        posting_header.gram = posting->gram;
+        posting_header.container_count = (uint32_t)posting->lines.count;
+        posting_header.cardinality = posting->lines.cardinality;
+        ok = aklv_write_all(stream, &posting_header, sizeof(posting_header));
+        for (uint64_t c = 0; ok && c < posting->lines.count; c++) {
+            const AklvRoaringContainer *container = &posting->lines.containers[c];
+            AklvIndexCacheContainerHeader container_header;
+            memset(&container_header, 0, sizeof(container_header));
+            container_header.key = container->key;
+            container_header.cardinality = container->type == AKLV_ROARING_FULL ? 65536 : container->cardinality;
+            container_header.type = (uint32_t)container->type;
+            container_header.payload_count = aklv_cache_container_payload_count(container);
+            uint64_t payload_bytes = aklv_cache_container_payload_bytes(container);
+            if (payload_bytes > UINT64_MAX - header.payload_bytes) {
                 ok = false;
                 break;
             }
-            header.gram_count++;
-            header.total_container_count += plan.container_count;
-            header.payload_bytes = aklv_cache_saturating_add_u64(header.payload_bytes,
-                                                                 plan.payload_bytes);
-            ok = aklv_cache_write_posting_range(stream,
-                                                scratch,
-                                                posting,
-                                                container_plans,
-                                                plan);
+            header.payload_bytes += payload_bytes;
+            ok = aklv_write_all(stream, &container_header, sizeof(container_header)) &&
+                 aklv_cache_write_container_payload(stream, container);
         }
     }
+    header.gram_count = written_postings;
     if (ok) {
-        ok = fflush(stream) == 0 &&
-             fseek(stream, 0, SEEK_SET) == 0 &&
-             aklv_write_all(stream, &header, sizeof(header));
+        ok = fseek(stream, 0, SEEK_SET) == 0 &&
+             aklv_write_all(stream, &header, sizeof(header)) &&
+             fseek(stream, 0, SEEK_END) == 0;
+    }
+    if (ok) {
+        ok = fflush(stream) == 0;
     }
     if (fclose(stream) != 0) {
         ok = false;
     }
+    stream = NULL;
     if (!ok || rename(tmp_path, cache_path) != 0) {
-        aklv_set_error(error, error_cap, "failed to write cache shard: %s", cache_path);
+        aklv_set_error(error, error_cap, "failed to write cache file: %s", cache_path);
         unlink(tmp_path);
-        free(cache_path);
-        return false;
+        goto done;
     }
-    bool added = true;
+
     if (cache != NULL) {
-        added = aklv_index_cache_add_shard(cache, shard_index, first_line, last_line, cache_path);
+        free(cache->path);
+        cache->path = aklv_strdup(cache_path);
+        cache->file_size = header.file_size;
+        cache->file_mtime_sec = header.file_mtime_sec;
+        cache->file_mtime_nsec = header.file_mtime_nsec;
+        cache->line_count = header.line_count;
+        cache->offset_count = header.offset_count;
+        cache->gram_count = header.gram_count;
+        cache->total_container_count = header.total_container_count;
+        cache->payload_bytes = header.payload_bytes;
+        cache->available = cache->path != NULL;
+        if (!cache->available) {
+            aklv_set_error(error, error_cap, "failed to remember cache file");
+            goto done;
+        }
     }
-    free(cache_path);
-    if (!added) {
-        aklv_set_error(error, error_cap, "failed to remember cache shard");
-        return false;
-    }
-    return true;
-}
+    rc = 0;
 
-static int aklv_index_cache_write_files(const char *path,
-                                        const AklvMappedFile *mapped,
-                                        AklvLineIndex *index,
-                                        AklvIndexCache *cache,
-                                        const char hash[33],
-                                        char *error,
-                                        size_t error_cap) {
-    (void)mapped;
-    AklvGramPosting **postings = NULL;
-    uint64_t posting_count = 0;
-    AklvCacheKeyPlan key_plan;
-    AklvCacheContainerWritePlan *container_plans = NULL;
-    uint32_t *posting_marks = NULL;
-    uint32_t *shard_posting_indices = NULL;
-    unsigned char *stream_buffer = NULL;
-    AklvCacheWriteScratch scratch;
-    AklvCacheFileIdentity identity;
-    memset(&scratch, 0, sizeof(scratch));
-    memset(&key_plan, 0, sizeof(key_plan));
-    memset(&identity, 0, sizeof(identity));
-    if (!aklv_file_stat_identity(path, &identity.file_size, &identity.mtime_sec, &identity.mtime_nsec)) {
-        aklv_set_error(error, error_cap, "stat file failed before cache store: %s: %s", path, strerror(errno));
-        return -1;
+done:
+    if (stream != NULL) {
+        fclose(stream);
+        unlink(tmp_path);
     }
-    if (!aklv_cache_collect_all_postings(&index->gram_index, &postings, &posting_count) ||
-        !aklv_cache_build_key_plan(index, postings, posting_count, &key_plan)) {
-        free(postings);
-        aklv_cache_key_plan_destroy(&key_plan);
-        aklv_set_error(error, error_cap, "failed to plan cache shards");
-        return -1;
-    }
-    bool needs_posting_buckets = false;
-    if (key_plan.key_count > 0) {
-        uint64_t total = AKLV_INDEX_CACHE_HEADER_SIZE;
-        uint64_t last_line = 1;
-        for (uint64_t key = 0; key < key_plan.key_count; key++) {
-            uint64_t key_last = aklv_cache_key_last_line(key, index->count);
-            uint64_t add = key_plan.key_bytes[key];
-            if (last_line > 1 && (add > UINT64_MAX - total || total + add > AKLV_INDEX_SHARD_MAX_BYTES)) {
-                needs_posting_buckets = true;
-                break;
-            }
-            total = aklv_cache_saturating_add_u64(total, add);
-            last_line = key_last;
-        }
-        if (last_line < index->count) {
-            needs_posting_buckets = true;
-        }
-    }
-    if (needs_posting_buckets && !aklv_cache_build_posting_buckets(&key_plan, postings, posting_count)) {
-        free(postings);
-        aklv_cache_key_plan_destroy(&key_plan);
-        aklv_set_error(error, error_cap, "failed to build cache shard posting buckets");
-        return -1;
-    }
-    if (needs_posting_buckets && posting_count > 0) {
-        if (posting_count > (uint64_t)(SIZE_MAX / sizeof(*posting_marks))) {
-            free(postings);
-            aklv_cache_key_plan_destroy(&key_plan);
-            aklv_set_error(error, error_cap, "too many postings to plan cache shard");
-            return -1;
-        }
-        posting_marks = calloc((size_t)posting_count, sizeof(*posting_marks));
-        shard_posting_indices = malloc((size_t)posting_count * sizeof(*shard_posting_indices));
-        if (posting_marks == NULL || shard_posting_indices == NULL) {
-            free(shard_posting_indices);
-            free(posting_marks);
-            free(postings);
-            aklv_cache_key_plan_destroy(&key_plan);
-            aklv_set_error(error, error_cap, "failed to allocate cache shard posting plan");
-            return -1;
-        }
-    }
-
-    uint64_t max_container_count = 0;
-    for (uint64_t i = 0; i < posting_count; i++) {
-        if (postings[i]->lines.count > max_container_count) {
-            max_container_count = postings[i]->lines.count;
-        }
-    }
-    if (max_container_count > (uint64_t)UINT32_MAX ||
-        max_container_count > (uint64_t)(SIZE_MAX / sizeof(*container_plans))) {
-        free(shard_posting_indices);
-        free(posting_marks);
-        free(postings);
-        aklv_cache_key_plan_destroy(&key_plan);
-        aklv_set_error(error, error_cap, "too many posting containers to plan cache shard");
-        return -1;
-    }
-    if (max_container_count != 0) {
-        container_plans = malloc((size_t)max_container_count * sizeof(*container_plans));
-        if (container_plans == NULL) {
-            free(shard_posting_indices);
-            free(posting_marks);
-            free(postings);
-            aklv_cache_key_plan_destroy(&key_plan);
-            aklv_set_error(error, error_cap, "failed to allocate cache container plan");
-            return -1;
-        }
-    }
-    stream_buffer = malloc(AKLV_CACHE_STREAM_BUFFER_BYTES);
-    if (!aklv_cache_write_scratch_init(&scratch)) {
-        free(stream_buffer);
-        free(container_plans);
-        free(shard_posting_indices);
-        free(posting_marks);
-        free(postings);
-        aklv_cache_key_plan_destroy(&key_plan);
-        aklv_set_error(error, error_cap, "failed to allocate cache write scratch");
-        return -1;
-    }
-
-    uint32_t shard_index = 0;
-    uint64_t first_line = 1;
-    while (first_line <= index->count) {
-        uint64_t last_good_line = index->count;
-        if (key_plan.key_count > 0) {
-            uint64_t first_key = first_line >> 16;
-            uint64_t total = AKLV_INDEX_CACHE_HEADER_SIZE;
-            uint64_t key = first_key;
-            last_good_line = first_line;
-            while (key < key_plan.key_count) {
-                uint64_t key_last = aklv_cache_key_last_line(key, index->count);
-                if (key_last < first_line) {
-                    key++;
-                    continue;
-                }
-                uint64_t add = key_plan.key_bytes[key];
-                if ((add > UINT64_MAX - total || total + add > AKLV_INDEX_SHARD_MAX_BYTES) &&
-                    key > first_key) {
-                    break;
-                }
-                total = aklv_cache_saturating_add_u64(total, add);
-                last_good_line = key_last;
-                if (last_good_line >= index->count) {
-                    break;
-                }
-                key++;
-            }
-            if (last_good_line < first_line) {
-                last_good_line = first_line;
-            }
-        }
-        if (!aklv_cache_write_shard(&identity,
-                                    index,
-                                    cache,
-                                    hash,
-                                    postings,
-                                    posting_count,
-                                    &key_plan,
-                                    container_plans,
-                                    &scratch,
-                                    (uint32_t)max_container_count,
-                                    posting_marks,
-                                    shard_posting_indices,
-                                    shard_index + 1,
-                                    stream_buffer,
-                                    shard_index,
-                                    first_line,
-                                    last_good_line,
-                                    error,
-                                    error_cap)) {
-            aklv_cache_write_scratch_destroy(&scratch);
-            free(stream_buffer);
-            free(container_plans);
-            free(shard_posting_indices);
-            free(posting_marks);
-            free(postings);
-            aklv_cache_key_plan_destroy(&key_plan);
-            return -1;
-        }
-        shard_index++;
-        if (last_good_line == UINT64_MAX || last_good_line >= index->count) {
-            break;
-        }
-        first_line = last_good_line + 1;
-    }
-    aklv_cache_write_scratch_destroy(&scratch);
+    free(offset_values);
     free(stream_buffer);
-    free(container_plans);
-    free(shard_posting_indices);
-    free(posting_marks);
-    free(postings);
-    aklv_cache_key_plan_destroy(&key_plan);
-    return 0;
+    free(cache_path);
+    return rc;
 }
 
 int aklv_index_cache_store(const char *path,
@@ -2823,7 +1695,8 @@ int aklv_index_cache_store(const char *path,
                            AklvLineIndex *index,
                            char *error,
                            size_t error_cap) {
-    if (path == NULL || mapped == NULL || index == NULL || index->count == 0) {
+    (void)mapped;
+    if (path == NULL || index == NULL || index->count == 0) {
         return 0;
     }
     if (!aklv_cache_dir_ensure(error, error_cap)) {
@@ -2845,19 +1718,18 @@ int aklv_index_cache_store(const char *path,
     index->cache.dir = aklv_strdup(AKLV_INDEX_CACHE_DIR);
     if (index->cache.dir == NULL || !aklv_index_cache_hash_path(path, index->cache.hash)) {
         aklv_set_error(error, error_cap, "failed to initialize index cache metadata");
+        aklv_index_cache_destroy(&index->cache);
         return -1;
     }
 
-    if (aklv_index_cache_write_files(path,
-                                     mapped,
-                                     index,
-                                     &index->cache,
-                                     index->cache.hash,
-                                     error,
-                                     error_cap) != 0) {
+    if (aklv_index_cache_write_file(path,
+                                    index,
+                                    &index->cache,
+                                    index->cache.hash,
+                                    error,
+                                    error_cap) != 0) {
         return -1;
     }
-    index->cache.available = index->cache.shard_count > 0;
     aklv_gram_index_destroy(&index->gram_index);
     return 0;
 }
@@ -2867,7 +1739,8 @@ static int aklv_index_cache_store_files_only(const char *path,
                                              AklvLineIndex *index,
                                              char *error,
                                              size_t error_cap) {
-    if (path == NULL || mapped == NULL || index == NULL || index->count == 0) {
+    (void)mapped;
+    if (path == NULL || index == NULL || index->count == 0) {
         return 0;
     }
     if (!aklv_cache_dir_ensure(error, error_cap)) {
@@ -2878,7 +1751,7 @@ static int aklv_index_cache_store_files_only(const char *path,
         aklv_set_error(error, error_cap, "failed to initialize index cache metadata");
         return -1;
     }
-    return aklv_index_cache_write_files(path, mapped, index, NULL, hash, error, error_cap);
+    return aklv_index_cache_write_file(path, index, NULL, hash, error, error_cap);
 }
 
 typedef struct {
@@ -3009,68 +1882,49 @@ int aklv_index_cache_try_load(const char *path,
     }
     snprintf(index->cache.hash, sizeof(index->cache.hash), "%s", hash);
 
-    uint32_t shard_index = 0;
-    uint64_t expected_first_line = 1;
-    uint64_t expected_line_count = 0;
-    while (true) {
-        char *cache_path = aklv_index_cache_path_for(hash, shard_index);
-        if (cache_path == NULL) {
-            aklv_line_index_destroy(index);
-            return -1;
-        }
-        FILE *stream = fopen(cache_path, "rb");
-        if (stream == NULL) {
-            free(cache_path);
-            break;
-        }
-        AklvIndexCacheFileHeader header;
-        bool ok = aklv_cache_read_header(stream, &header, error, error_cap);
-        if (ok) {
-            ok = header.shard_index == shard_index &&
-                 header.file_size == file_size &&
-                 header.file_mtime_sec == mtime_sec &&
-                 header.file_mtime_nsec == mtime_nsec &&
-                 header.first_line == expected_first_line &&
-                 header.last_line >= header.first_line &&
-                 header.offset_count == header.last_line - header.first_line + 1;
-        }
-        if (ok && shard_index == 0) {
-            expected_line_count = header.line_count;
-            uint64_t block_capacity =
-                (expected_line_count + AKLV_LINE_INDEX_BLOCK_LINES - 1) >>
-                AKLV_LINE_INDEX_BLOCK_SHIFT;
-            ok = aklv_line_index_reserve_block_arrays(index,
-                                                      block_capacity,
-                                                      error,
-                                                      error_cap) == 0;
-        }
-        if (ok) {
-            ok = header.line_count == expected_line_count &&
-                 aklv_cache_read_offsets(stream, index, header.offset_count, error, error_cap);
-        }
-        fclose(stream);
-        if (!ok ||
-            !aklv_index_cache_add_shard(&index->cache,
-                                        shard_index,
-                                        header.first_line,
-                                        header.last_line,
-                                        cache_path)) {
-            free(cache_path);
-            aklv_line_index_destroy(index);
-            return 1;
-        }
-        expected_first_line = header.last_line + 1;
-        free(cache_path);
-        shard_index++;
-        if (index->count == expected_line_count) {
-            break;
-        }
+    char *cache_path = aklv_index_cache_path_for(hash);
+    if (cache_path == NULL) {
+        aklv_line_index_destroy(index);
+        return -1;
     }
-    if (index->count == 0 || index->count != expected_line_count) {
+    FILE *stream = fopen(cache_path, "rb");
+    if (stream == NULL) {
+        free(cache_path);
         aklv_line_index_destroy(index);
         return 1;
     }
-    index->cache.available = index->cache.shard_count > 0;
+    AklvIndexCacheFileHeader header;
+    bool ok = aklv_cache_read_header(stream, &header, error, error_cap);
+    if (ok) {
+        ok = header.file_size == file_size &&
+             header.file_mtime_sec == mtime_sec &&
+             header.file_mtime_nsec == mtime_nsec &&
+             header.line_count != 0 &&
+             header.offset_count == header.line_count &&
+             header.first_line == 1 &&
+             header.last_line == header.line_count;
+    }
+    if (ok) {
+        uint64_t block_capacity =
+            (header.line_count + AKLV_LINE_INDEX_BLOCK_LINES - 1) >>
+            AKLV_LINE_INDEX_BLOCK_SHIFT;
+        ok = aklv_line_index_reserve_block_arrays(index,
+                                                  block_capacity,
+                                                  error,
+                                                  error_cap) == 0 &&
+             aklv_cache_read_offsets(stream, index, header.offset_count, error, error_cap);
+    }
+    fclose(stream);
+    if (!ok || index->count != header.line_count) {
+        free(cache_path);
+        aklv_line_index_destroy(index);
+        return 1;
+    }
+    index->cache.path = cache_path;
+    index->cache.gram_count = header.gram_count;
+    index->cache.total_container_count = header.total_container_count;
+    index->cache.payload_bytes = header.payload_bytes;
+    index->cache.available = true;
     return 0;
 }
 
@@ -3174,21 +2028,21 @@ static bool aklv_cache_read_container(FILE *stream,
     }
 }
 
-int aklv_index_cache_load_shard(const AklvIndexCacheShard *shard,
-                                const AklvMappedFile *mapped,
-                                AklvGramIndex *gram_index,
-                                char *error,
-                                size_t error_cap) {
+static int aklv_index_cache_load_file(AklvIndexCache *cache,
+                                      const AklvMappedFile *mapped,
+                                      AklvGramIndex *gram_index,
+                                      char *error,
+                                      size_t error_cap) {
     (void)mapped;
     memset(gram_index, 0, sizeof(*gram_index));
-    if (shard == NULL || shard->path == NULL) {
+    if (cache == NULL || cache->path == NULL) {
         return -1;
     }
     int rc = -1;
     unsigned char *stream_buffer = NULL;
-    FILE *stream = fopen(shard->path, "rb");
+    FILE *stream = fopen(cache->path, "rb");
     if (stream == NULL) {
-        aklv_set_error(error, error_cap, "failed to open index shard: %s", shard->path);
+        aklv_set_error(error, error_cap, "failed to open index cache: %s", cache->path);
         return -1;
     }
     stream_buffer = malloc(AKLV_CACHE_STREAM_BUFFER_BYTES);
@@ -3199,8 +2053,13 @@ int aklv_index_cache_load_shard(const AklvIndexCacheShard *shard,
     if (!aklv_cache_read_header(stream, &header, error, error_cap)) {
         goto done;
     }
+    if (header.offset_count > UINT64_MAX / sizeof(uint64_t)) {
+        aklv_set_error(error, error_cap, "cached offset table too large");
+        goto done;
+    }
     uint64_t offset_bytes = header.offset_count * sizeof(uint64_t);
-    if (fseek(stream, (long)(AKLV_INDEX_CACHE_HEADER_SIZE + offset_bytes), SEEK_SET) != 0) {
+    if (offset_bytes > (uint64_t)LONG_MAX - AKLV_INDEX_CACHE_HEADER_SIZE ||
+        fseek(stream, (long)(AKLV_INDEX_CACHE_HEADER_SIZE + offset_bytes), SEEK_SET) != 0) {
         aklv_set_error(error, error_cap, "failed to seek cached gram postings");
         goto done;
     }
@@ -3234,7 +2093,7 @@ int aklv_index_cache_load_shard(const AklvIndexCacheShard *shard,
             aklv_set_error(error, error_cap, "cached container arena too large");
             goto done;
         }
-        container_arena = calloc(header.total_container_count, sizeof(*container_arena));
+        container_arena = malloc((size_t)header.total_container_count * sizeof(*container_arena));
         if (container_arena == NULL) {
             aklv_set_error(error, error_cap, "failed to allocate cached container arena");
             goto done;
@@ -3262,17 +2121,18 @@ int aklv_index_cache_load_shard(const AklvIndexCacheShard *shard,
             posting->lines.borrowed_payloads = payload_arena != NULL;
             container_arena_used += posting_header.container_count;
         }
-        posting->lines.count = posting_header.container_count;
+        posting->lines.count = 0;
         posting->lines.capacity = posting_header.container_count;
         posting->lines.cardinality = posting_header.cardinality;
         for (uint32_t c = 0; c < posting_header.container_count; c++) {
             if (!aklv_cache_read_container(stream,
-                                               &posting->lines.containers[c],
-                                               &payload_state,
-                                               error,
-                                               error_cap)) {
+                                           &posting->lines.containers[c],
+                                           &payload_state,
+                                           error,
+                                           error_cap)) {
                 goto done;
             }
+            posting->lines.count++;
         }
     }
     gram_index->container_arena = container_arena;
@@ -3292,45 +2152,44 @@ done:
     return rc;
 }
 
-int aklv_index_cache_get_shard_index(AklvIndexCache *cache,
-                                     AklvIndexCacheShard *shard,
-                                     const AklvMappedFile *mapped,
-                                     const AklvGramIndex **gram_index,
-                                     char *error,
-                                     size_t error_cap) {
+int aklv_index_cache_get_index(AklvIndexCache *cache,
+                               const AklvMappedFile *mapped,
+                               const AklvGramIndex **gram_index,
+                               char *error,
+                               size_t error_cap) {
     if (gram_index != NULL) {
         *gram_index = NULL;
     }
-    if (cache == NULL || shard == NULL || gram_index == NULL) {
+    if (cache == NULL || gram_index == NULL || !cache->available) {
         return -1;
     }
     pthread_mutex_lock(&cache->mutex);
-    while (!shard->gram_index_loaded && shard->gram_index_loading) {
+    while (!cache->gram_index_loaded && cache->gram_index_loading) {
         pthread_cond_wait(&cache->cond, &cache->mutex);
     }
-    if (shard->gram_index_loaded) {
-        *gram_index = &shard->gram_index;
+    if (cache->gram_index_loaded) {
+        *gram_index = &cache->gram_index;
         pthread_mutex_unlock(&cache->mutex);
         return 0;
     }
-    shard->gram_index_loading = true;
+    cache->gram_index_loading = true;
     pthread_mutex_unlock(&cache->mutex);
 
     AklvGramIndex loaded;
-    int rc = aklv_index_cache_load_shard(shard, mapped, &loaded, error, error_cap);
+    int rc = aklv_index_cache_load_file(cache, mapped, &loaded, error, error_cap);
 
     pthread_mutex_lock(&cache->mutex);
-    if (rc == 0 && !shard->gram_index_loaded) {
-        shard->gram_index = loaded;
+    if (rc == 0 && !cache->gram_index_loaded) {
+        cache->gram_index = loaded;
         memset(&loaded, 0, sizeof(loaded));
-        shard->gram_index_loaded = true;
+        cache->gram_index_loaded = true;
     } else if (rc == 0) {
         aklv_gram_index_destroy(&loaded);
     }
-    shard->gram_index_loading = false;
+    cache->gram_index_loading = false;
     pthread_cond_broadcast(&cache->cond);
-    if (rc == 0 && shard->gram_index_loaded) {
-        *gram_index = &shard->gram_index;
+    if (rc == 0 && cache->gram_index_loaded) {
+        *gram_index = &cache->gram_index;
     } else {
         *gram_index = NULL;
     }
@@ -3363,6 +2222,7 @@ static int aklv_line_index_add_ngrams(AklvGramIndex *gram_index,
                                       AklvLineView effective,
                                       uint64_t line_no,
                                       AklvGramScratch *scratch,
+                                      bool scratch_prepared,
                                       char *error,
                                       size_t error_cap) {
     aklv_gram_scratch_reset(scratch);
@@ -3375,7 +2235,12 @@ static int aklv_line_index_add_ngrams(AklvGramIndex *gram_index,
     if (max_grams == 0) {
         return 0;
     }
-    if (aklv_gram_scratch_prepare_line(scratch, max_grams, error, error_cap) != 0) {
+    if (scratch_prepared) {
+        if (scratch->seen_words == NULL || max_grams > scratch->capacity) {
+            aklv_set_error(error, error_cap, "prepared line gram scratch too small");
+            return -1;
+        }
+    } else if (aklv_gram_scratch_prepare_line(scratch, max_grams, error, error_cap) != 0) {
         return -1;
     }
     size_t i = 0;
@@ -3509,6 +2374,7 @@ static void *aklv_gram_build_worker_main(void *arg) {
         return NULL;
     }
     size_t max_line_grams = aklv_gram_build_task_max_line_grams(task);
+    bool scratch_prepared = false;
     if (max_line_grams > 0 &&
         aklv_gram_scratch_prepare_line(&scratch,
                                        max_line_grams,
@@ -3517,6 +2383,7 @@ static void *aklv_gram_build_worker_main(void *arg) {
         task->status = -1;
         return NULL;
     }
+    scratch_prepared = max_line_grams > 0;
     for (uint64_t line_no = task->first_line; line_no <= task->last_line; line_no++) {
         if (task->build_cancel != NULL &&
             atomic_load_explicit(task->build_cancel, memory_order_relaxed)) {
@@ -3540,6 +2407,7 @@ static void *aklv_gram_build_worker_main(void *arg) {
                                        effective,
                                        line_no,
                                        &scratch,
+                                       scratch_prepared,
                                        task->error,
                                        sizeof(task->error)) != 0) {
             task->status = -1;
@@ -3712,7 +2580,7 @@ int aklv_build_line_index(const AklvMappedFile *mapped,
                 break;
             }
             if (!aklv_gram_index_merge_move(&index->gram_index, &tasks[i].gram_index)) {
-                aklv_set_error(error, error_cap, "failed to merge index build shards");
+                aklv_set_error(error, error_cap, "failed to merge index build workers");
                 rc = -1;
                 break;
             }
