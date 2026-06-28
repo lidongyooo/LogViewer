@@ -8,9 +8,15 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef AKLV_SEARCH_CHUNK_LINES
 #define AKLV_SEARCH_CHUNK_LINES UINT64_C(2000000)
+#endif
+#ifndef AKLV_SEARCH_CANCEL_CHECK_LINES
 #define AKLV_SEARCH_CANCEL_CHECK_LINES UINT64_C(200000)
+#endif
 #define AKLV_SIMD_SHORT_QUERY_MAX 16
+#define AKLV_QUERY_INLINE_PATTERN_BYTES 256
+#define AKLV_QUERY_INLINE_GRAMS 256
 
 typedef enum {
     AKLV_QUERY_KERNEL_BMH = 0,
@@ -20,6 +26,7 @@ typedef enum {
 typedef struct {
     unsigned char lower[256];
     unsigned char *pattern;
+    unsigned char inline_pattern[AKLV_QUERY_INLINE_PATTERN_BYTES];
     size_t pattern_len;
     size_t skip[256];
     AklvQueryKernel kernel;
@@ -28,7 +35,11 @@ typedef struct {
     unsigned char anchor_pair;
     bool anchor_has_pair;
     uint32_t *grams;
+    uint32_t inline_grams[AKLV_QUERY_INLINE_GRAMS];
     size_t gram_count;
+    size_t gram_capacity;
+    bool pattern_heap;
+    bool grams_heap;
 } AklvCompiledQuery;
 
 typedef struct {
@@ -40,6 +51,7 @@ typedef struct {
 typedef struct {
     uint64_t seq;
     uint32_t file_index;
+    uint32_t shard_index;
     uint64_t first_line;
     uint64_t last_line;
 } AklvSearchTask;
@@ -51,9 +63,21 @@ typedef struct {
 } AklvSearchTaskVec;
 
 typedef struct {
+    const AklvRoaring **items;
+    size_t count;
+    bool owns_items;
+} AklvPostingPlan;
+
+typedef struct {
     pthread_t thread;
     struct AklvSearchService *service;
     AklvResultVec local_results;
+    uint64_t posting_plan_generation;
+    const AklvGramIndex *posting_plan_index;
+    bool posting_plan_valid;
+    bool posting_plan_has_candidates;
+    AklvPostingPlan posting_plan;
+    const AklvRoaring *posting_plan_stack[AKLV_QUERY_INLINE_GRAMS];
 } AklvSearchWorker;
 
 typedef struct {
@@ -82,7 +106,7 @@ struct AklvSearchService {
     const AklvSearchTask *tasks;
     AklvResultVec *task_results;
     uint64_t task_count;
-    uint64_t next_task;
+    atomic_uint_fast64_t next_task;
 
     AklvSearchJob queued_job;
     AklvSearchJob active_job;
@@ -157,20 +181,48 @@ static void aklv_compiled_query_destroy(AklvCompiledQuery *compiled) {
     if (compiled == NULL) {
         return;
     }
-    free(compiled->pattern);
-    free(compiled->grams);
+    if (compiled->pattern_heap) {
+        free(compiled->pattern);
+    }
+    if (compiled->grams_heap) {
+        free(compiled->grams);
+    }
     memset(compiled, 0, sizeof(*compiled));
+}
+
+static void aklv_compiled_query_rebind_inline(AklvCompiledQuery *compiled) {
+    if (compiled == NULL) {
+        return;
+    }
+    if (!compiled->pattern_heap) {
+        compiled->pattern = compiled->inline_pattern;
+    }
+    if (!compiled->grams_heap) {
+        compiled->grams = compiled->inline_grams;
+    }
+}
+
+static int aklv_compare_u32(const void *a, const void *b) {
+    uint32_t va = *(const uint32_t *)a;
+    uint32_t vb = *(const uint32_t *)b;
+    return (va > vb) - (va < vb);
 }
 
 static bool aklv_compiled_query_init_grams(AklvCompiledQuery *compiled) {
     size_t len = compiled->pattern_len;
-    if (len == 0) {
+    compiled->grams = compiled->inline_grams;
+    compiled->gram_capacity = AKLV_QUERY_INLINE_GRAMS;
+    if (len < AKLV_ASCII_GRAM_MAX_SIZE) {
         return true;
     }
-    size_t max_count = len;
-    compiled->grams = malloc(max_count * sizeof(*compiled->grams));
-    if (compiled->grams == NULL) {
-        return false;
+    size_t max_count = len - AKLV_ASCII_GRAM_MAX_SIZE + 1;
+    if (max_count > AKLV_QUERY_INLINE_GRAMS) {
+        compiled->grams = malloc(max_count * sizeof(*compiled->grams));
+        if (compiled->grams == NULL) {
+            return false;
+        }
+        compiled->gram_capacity = max_count;
+        compiled->grams_heap = true;
     }
 
     size_t i = 0;
@@ -186,19 +238,31 @@ static bool aklv_compiled_query_init_grams(AklvCompiledQuery *compiled) {
         if (run_len < AKLV_ASCII_GRAM_MAX_SIZE) {
             continue;
         }
-        for (size_t pos = run_start; pos + AKLV_ASCII_GRAM_MAX_SIZE <= i; pos++) {
-            uint32_t gram = aklv_ngram_key(compiled->pattern + pos, AKLV_ASCII_GRAM_MAX_SIZE);
-            bool seen = false;
-            for (size_t j = 0; j < compiled->gram_count; j++) {
-                if (compiled->grams[j] == gram) {
-                    seen = true;
-                    break;
-                }
+        uint32_t first = compiled->pattern[run_start];
+        uint32_t second = compiled->pattern[run_start + 1];
+        for (size_t pos = run_start + AKLV_ASCII_GRAM_MAX_SIZE - 1; pos < i; pos++) {
+            uint32_t third = compiled->pattern[pos];
+            uint32_t gram = (AKLV_ASCII_GRAM_MAX_SIZE << 24) |
+                            (first << 16) |
+                            (second << 8) |
+                            third;
+            if (compiled->gram_count == compiled->gram_capacity) {
+                return false;
             }
-            if (!seen) {
-                compiled->grams[compiled->gram_count++] = gram;
+            compiled->grams[compiled->gram_count++] = gram;
+            first = second;
+            second = third;
+        }
+    }
+    if (compiled->gram_count > 1) {
+        qsort(compiled->grams, compiled->gram_count, sizeof(*compiled->grams), aklv_compare_u32);
+        size_t out = 1;
+        for (size_t read = 1; read < compiled->gram_count; read++) {
+            if (compiled->grams[read] != compiled->grams[out - 1]) {
+                compiled->grams[out++] = compiled->grams[read];
             }
         }
+        compiled->gram_count = out;
     }
     return true;
 }
@@ -211,9 +275,13 @@ static bool aklv_compiled_query_init(AklvCompiledQuery *compiled,
     aklv_init_ascii_lower(compiled->lower);
     size_t len = strlen(query);
     compiled->pattern_len = len;
-    compiled->pattern = malloc(len == 0 ? 1 : len);
-    if (compiled->pattern == NULL) {
-        return false;
+    compiled->pattern = compiled->inline_pattern;
+    if (len > AKLV_QUERY_INLINE_PATTERN_BYTES) {
+        compiled->pattern = malloc(len);
+        if (compiled->pattern == NULL) {
+            return false;
+        }
+        compiled->pattern_heap = true;
     }
     for (size_t i = 0; i < len; i++) {
         compiled->pattern[i] = compiled->lower[(unsigned char)query[i]];
@@ -370,8 +438,25 @@ static void aklv_task_vec_destroy(AklvSearchTaskVec *vec) {
     memset(vec, 0, sizeof(*vec));
 }
 
+static bool aklv_task_vec_reserve(AklvSearchTaskVec *vec, uint64_t capacity) {
+    if (capacity <= vec->capacity) {
+        return true;
+    }
+    if (capacity > (uint64_t)(SIZE_MAX / sizeof(*vec->items))) {
+        return false;
+    }
+    AklvSearchTask *new_items = realloc(vec->items, (size_t)capacity * sizeof(*vec->items));
+    if (new_items == NULL) {
+        return false;
+    }
+    vec->items = new_items;
+    vec->capacity = capacity;
+    return true;
+}
+
 static bool aklv_task_vec_append(AklvSearchTaskVec *vec,
                                  uint32_t file_index,
+                                 uint32_t shard_index,
                                  uint64_t first_line,
                                  uint64_t last_line) {
     if (first_line == 0 || last_line < first_line) {
@@ -383,16 +468,14 @@ static bool aklv_task_vec_append(AklvSearchTaskVec *vec,
             new_capacity > (uint64_t)(SIZE_MAX / sizeof(*vec->items))) {
             return false;
         }
-        AklvSearchTask *new_items = realloc(vec->items, (size_t)new_capacity * sizeof(*vec->items));
-        if (new_items == NULL) {
+        if (!aklv_task_vec_reserve(vec, new_capacity)) {
             return false;
         }
-        vec->items = new_items;
-        vec->capacity = new_capacity;
     }
     uint64_t seq = vec->count;
     vec->items[seq].seq = seq;
     vec->items[seq].file_index = file_index;
+    vec->items[seq].shard_index = shard_index;
     vec->items[seq].first_line = first_line;
     vec->items[seq].last_line = last_line;
     vec->count++;
@@ -401,6 +484,7 @@ static bool aklv_task_vec_append(AklvSearchTaskVec *vec,
 
 static bool aklv_task_vec_append_chunks(AklvSearchTaskVec *vec,
                                         uint32_t file_index,
+                                        uint32_t shard_index,
                                         uint64_t first_line,
                                         uint64_t last_line) {
     if (first_line == 0 || last_line < first_line) {
@@ -412,7 +496,7 @@ static bool aklv_task_vec_append_chunks(AklvSearchTaskVec *vec,
         if (chunk_last < line || chunk_last > last_line) {
             chunk_last = last_line;
         }
-        if (!aklv_task_vec_append(vec, file_index, line, chunk_last)) {
+        if (!aklv_task_vec_append(vec, file_index, shard_index, line, chunk_last)) {
             return false;
         }
         if (chunk_last == UINT64_MAX) {
@@ -512,24 +596,6 @@ static bool aklv_search_results_reserve(AklvSearchResults *results, uint64_t cap
     return true;
 }
 
-static bool aklv_search_results_append_batch(AklvSearchResults *results,
-                                             const AklvSearchResult *items,
-                                             uint64_t count) {
-    if (count == 0) {
-        return true;
-    }
-    if (count > UINT64_MAX - results->count) {
-        return false;
-    }
-    uint64_t needed = results->count + count;
-    if (!aklv_search_results_reserve(results, needed)) {
-        return false;
-    }
-    memcpy(results->items + results->count, items, (size_t)count * sizeof(*items));
-    results->count = needed;
-    return true;
-}
-
 static void aklv_task_results_destroy(AklvResultVec *results, uint64_t count) {
     if (results == NULL) {
         return;
@@ -544,27 +610,72 @@ static bool aklv_publish_task_results(AklvSearchService *service,
                                       uint64_t generation,
                                       const char *query,
                                       double elapsed_sec,
-                                      const AklvResultVec *task_results,
+                                      AklvResultVec *task_results,
                                       uint64_t task_count,
                                       bool complete) {
+    if (task_count != 0 && task_results == NULL) {
+        return false;
+    }
+    uint64_t total = 0;
+    uint64_t nonempty_count = 0;
+    uint64_t nonempty_index = 0;
+    for (uint64_t i = 0; i < task_count; i++) {
+        if (task_results[i].count > UINT64_MAX - total) {
+            return false;
+        }
+        if (task_results[i].count != 0) {
+            nonempty_index = i;
+            nonempty_count++;
+        }
+        total += task_results[i].count;
+    }
+    if (total > (uint64_t)(SIZE_MAX / sizeof(AklvSearchResult))) {
+        return false;
+    }
+    AklvSearchResult *merged = NULL;
+    if (total > 0) {
+        if (nonempty_count == 1) {
+            AklvResultVec *src = &task_results[nonempty_index];
+            if (src->items == NULL) {
+                return false;
+            }
+            merged = src->items;
+            src->items = NULL;
+            src->count = 0;
+            src->capacity = 0;
+        } else {
+            merged = malloc((size_t)total * sizeof(*merged));
+            if (merged == NULL) {
+                return false;
+            }
+            uint64_t pos = 0;
+            for (uint64_t i = 0; i < task_count; i++) {
+                if (task_results[i].count == 0) {
+                    continue;
+                }
+                memcpy(merged + pos,
+                       task_results[i].items,
+                       (size_t)task_results[i].count * sizeof(*merged));
+                pos += task_results[i].count;
+            }
+        }
+    }
+
     pthread_mutex_lock(&service->mutex);
     if (service->stop || service->request_generation != generation) {
         pthread_mutex_unlock(&service->mutex);
+        free(merged);
         return false;
     }
+    free(service->pending.items);
+    service->pending.items = merged;
+    service->pending.count = total;
+    service->pending.capacity = total;
     service->pending.generation = generation;
     service->pending.running = !complete;
     service->pending.complete = complete;
     service->pending.elapsed_sec = elapsed_sec;
     snprintf(service->pending.query, sizeof(service->pending.query), "%s", query);
-    for (uint64_t i = 0; i < task_count; i++) {
-        if (!aklv_search_results_append_batch(&service->pending,
-                                              task_results[i].items,
-                                              task_results[i].count)) {
-            pthread_mutex_unlock(&service->mutex);
-            return false;
-        }
-    }
     pthread_mutex_unlock(&service->mutex);
     return true;
 }
@@ -626,49 +737,280 @@ static bool aklv_line_matches_at(const AklvFile *file,
     return true;
 }
 
-static const AklvRoaring *aklv_select_driver_posting(const AklvFile *file,
-                                                     const AklvCompiledQuery *compiled) {
-    const AklvRoaring *best = NULL;
-    uint64_t best_count = UINT64_MAX;
-    for (size_t i = 0; i < compiled->gram_count; i++) {
-        const AklvRoaring *posting = aklv_gram_index_get(&file->index.gram_index, compiled->grams[i]);
-        if (posting == NULL || aklv_roaring_cardinality(posting) == 0) {
-            return NULL;
-        }
-        uint64_t cardinality = aklv_roaring_cardinality(posting);
-        if (cardinality < best_count) {
-            best = posting;
-            best_count = cardinality;
-        }
+static void aklv_posting_plan_destroy(AklvPostingPlan *plan) {
+    if (plan->owns_items) {
+        free(plan->items);
     }
-    return best;
+    memset(plan, 0, sizeof(*plan));
 }
 
-static bool aklv_candidate_has_all_grams(const AklvFile *file,
-                                         const AklvCompiledQuery *compiled,
-                                         const AklvRoaring *driver,
-                                         uint64_t line_no) {
-    for (size_t i = 0; i < compiled->gram_count; i++) {
-        const AklvRoaring *posting = aklv_gram_index_get(&file->index.gram_index, compiled->grams[i]);
-        if (posting == NULL) {
+static bool aklv_build_posting_plan(const AklvGramIndex *gram_index,
+                                    const AklvCompiledQuery *compiled,
+                                    AklvPostingPlan *plan,
+                                    const AklvRoaring **scratch,
+                                    size_t scratch_count) {
+    memset(plan, 0, sizeof(*plan));
+    if (compiled->gram_count == 0) {
+        return false;
+    }
+    if (compiled->gram_count <= scratch_count) {
+        plan->items = scratch;
+    } else {
+        plan->items = malloc(compiled->gram_count * sizeof(*plan->items));
+        if (plan->items == NULL) {
             return false;
         }
-        if (posting != driver && !aklv_roaring_contains(posting, line_no)) {
+        plan->owns_items = true;
+    }
+    for (size_t i = 0; i < compiled->gram_count; i++) {
+        const AklvRoaring *posting = aklv_gram_index_get(gram_index, compiled->grams[i]);
+        if (posting == NULL || aklv_roaring_cardinality(posting) == 0) {
+            aklv_posting_plan_destroy(plan);
+            return false;
+        }
+        uint64_t cardinality = aklv_roaring_cardinality(posting);
+        size_t pos = plan->count;
+        while (pos > 0 && aklv_roaring_cardinality(plan->items[pos - 1]) > cardinality) {
+            plan->items[pos] = plan->items[pos - 1];
+            pos--;
+        }
+        plan->items[pos] = posting;
+        plan->count++;
+    }
+    return true;
+}
+
+static void aklv_worker_clear_posting_plan(AklvSearchWorker *worker) {
+    aklv_posting_plan_destroy(&worker->posting_plan);
+    worker->posting_plan_generation = 0;
+    worker->posting_plan_index = NULL;
+    worker->posting_plan_valid = false;
+    worker->posting_plan_has_candidates = false;
+}
+
+static bool aklv_worker_get_posting_plan(AklvSearchWorker *worker,
+                                         uint64_t generation,
+                                         const AklvGramIndex *gram_index,
+                                         const AklvCompiledQuery *compiled,
+                                         const AklvPostingPlan **plan_out,
+                                         bool *has_candidates_out) {
+    *plan_out = NULL;
+    *has_candidates_out = false;
+    if (worker->posting_plan_valid &&
+        worker->posting_plan_generation == generation &&
+        worker->posting_plan_index == gram_index) {
+        *has_candidates_out = worker->posting_plan_has_candidates;
+        if (worker->posting_plan_has_candidates) {
+            *plan_out = &worker->posting_plan;
+        }
+        return true;
+    }
+
+    aklv_worker_clear_posting_plan(worker);
+    worker->posting_plan_generation = generation;
+    worker->posting_plan_index = gram_index;
+    worker->posting_plan_valid = true;
+    worker->posting_plan_has_candidates =
+        aklv_build_posting_plan(gram_index,
+                                compiled,
+                                &worker->posting_plan,
+                                worker->posting_plan_stack,
+                                sizeof(worker->posting_plan_stack) /
+                                    sizeof(worker->posting_plan_stack[0]));
+    *has_candidates_out = worker->posting_plan_has_candidates;
+    if (worker->posting_plan_has_candidates) {
+        *plan_out = &worker->posting_plan;
+    }
+    return true;
+}
+
+static bool aklv_candidate_has_all_container_grams(const AklvPostingPlan *plan,
+                                                   const AklvRoaringContainer **containers,
+                                                   uint16_t low) {
+    for (size_t i = 1; i < plan->count; i++) {
+        if (!aklv_roaring_container_contains_low(containers[i], low)) {
             return false;
         }
     }
     return true;
 }
 
-static bool aklv_collect_file_range_matches(const AklvFile *file,
-                                            uint64_t first_line,
-                                            uint64_t last_line,
-                                            const AklvCompiledQuery *compiled,
-                                            uint64_t generation,
-                                            const AklvSearchService *service,
-                                            AklvResultVec *out) {
+static bool aklv_container_is_bitmap_like(const AklvRoaringContainer *container) {
+    return container != NULL &&
+           (container->type == AKLV_ROARING_BITMAP || container->type == AKLV_ROARING_FULL);
+}
+
+static uint64_t aklv_container_word_bits(const AklvRoaringContainer *container, uint32_t word_index) {
+    if (container->type == AKLV_ROARING_FULL) {
+        return UINT64_MAX;
+    }
+    return container->bitmap[word_index];
+}
+
+static bool aklv_result_for_candidate_line(const AklvFile *file,
+                                           uint64_t line_no,
+                                           const AklvCompiledQuery *compiled,
+                                           bool exact_validation_needed,
+                                           AklvResultVec *out) {
+    if (exact_validation_needed) {
+        return aklv_line_matches_at(file, line_no, compiled, out);
+    }
+    return aklv_result_vec_append(out,
+                                  file->id,
+                                  line_no,
+                                  (uint64_t)aklv_line_index_offset(&file->index, line_no));
+}
+
+static bool aklv_collect_bitmap_intersection_matches(const AklvFile *file,
+                                                     const AklvCompiledQuery *compiled,
+                                                     const AklvPostingPlan *plan,
+                                                     const AklvRoaringContainer **containers,
+                                                     uint16_t min_low,
+                                                     uint16_t max_low,
+                                                     bool exact_validation_needed,
+                                                     uint64_t generation,
+                                                     const AklvSearchService *service,
+                                                     uint64_t *next_cancel_check,
+                                                     AklvResultVec *out) {
+    uint32_t first_word = min_low >> 6;
+    uint32_t last_word = max_low >> 6;
+    for (uint32_t word_index = first_word; word_index <= last_word; word_index++) {
+        uint64_t bits = aklv_container_word_bits(containers[0], word_index);
+        for (size_t i = 1; bits != 0 && i < plan->count; i++) {
+            bits &= aklv_container_word_bits(containers[i], word_index);
+        }
+        if (word_index == first_word) {
+            uint32_t skip = min_low & 63U;
+            if (skip != 0) {
+                bits &= UINT64_MAX << skip;
+            }
+        }
+        if (word_index == last_word) {
+            uint32_t keep = (max_low & 63U) + 1U;
+            if (keep < 64U) {
+                bits &= (UINT64_C(1) << keep) - 1U;
+            }
+        }
+        while (bits != 0) {
+            uint32_t bit = (uint32_t)__builtin_ctzll(bits);
+            bits &= bits - 1;
+            uint64_t line_no = (containers[0]->key << 16) | (uint64_t)((word_index << 6) | bit);
+            if (line_no >= *next_cancel_check) {
+                if (aklv_generation_cancelled(service, generation)) {
+                    return false;
+                }
+                uint64_t next = line_no + AKLV_SEARCH_CANCEL_CHECK_LINES;
+                *next_cancel_check = next > line_no ? next : UINT64_MAX;
+            }
+            if (!aklv_result_for_candidate_line(file,
+                                                line_no,
+                                                compiled,
+                                                exact_validation_needed,
+                                                out)) {
+                return false;
+            }
+        }
+        if (word_index == UINT32_MAX) {
+            break;
+        }
+    }
+    return true;
+}
+
+static bool aklv_collect_driver_container_matches(const AklvFile *file,
+                                                  const AklvCompiledQuery *compiled,
+                                                  const AklvPostingPlan *plan,
+                                                  const AklvRoaringContainer **containers,
+                                                  uint64_t *container_indices,
+                                                  const AklvRoaringContainer *driver_container,
+                                                  uint16_t min_low,
+                                                  uint16_t max_low,
+                                                  uint64_t generation,
+                                                  const AklvSearchService *service,
+                                                  uint64_t *next_cancel_check,
+                                                  AklvResultVec *out) {
+    containers[0] = driver_container;
+    uint64_t driver_key = driver_container->key;
+    for (size_t i = 1; i < plan->count; i++) {
+        const AklvRoaring *posting = plan->items[i];
+        uint64_t pos = container_indices[i];
+        while (pos < posting->count && posting->containers[pos].key < driver_key) {
+            pos++;
+        }
+        container_indices[i] = pos;
+        if (pos >= posting->count || posting->containers[pos].key != driver_key) {
+            return true;
+        }
+        containers[i] = &posting->containers[pos];
+    }
+
+    bool exact_validation_needed =
+        !(compiled->pattern_len == AKLV_ASCII_GRAM_MAX_SIZE && compiled->gram_count == 1);
+    bool bitmap_fast_path = true;
+    for (size_t i = 0; i < plan->count; i++) {
+        if (!aklv_container_is_bitmap_like(containers[i])) {
+            bitmap_fast_path = false;
+            break;
+        }
+    }
+    if (bitmap_fast_path) {
+        bool ok = aklv_collect_bitmap_intersection_matches(file,
+                                                           compiled,
+                                                           plan,
+                                                           containers,
+                                                           min_low,
+                                                           max_low,
+                                                           exact_validation_needed,
+                                                           generation,
+                                                           service,
+                                                           next_cancel_check,
+                                                           out);
+        return ok;
+    }
+
+    bool ok = true;
+    AklvRoaringIter iter;
+    aklv_roaring_iter_init(&iter, plan->items[0], (driver_container->key << 16) | (uint64_t)min_low);
+    uint64_t line_no = 0;
+    while (aklv_roaring_iter_next(&iter, &line_no)) {
+        uint64_t key = line_no >> 16;
+        uint16_t low = (uint16_t)(line_no & 0xffffU);
+        if (key != driver_container->key || low > max_low) {
+            break;
+        }
+        if (line_no >= *next_cancel_check) {
+            if (aklv_generation_cancelled(service, generation)) {
+                ok = false;
+                break;
+            }
+            uint64_t next = line_no + AKLV_SEARCH_CANCEL_CHECK_LINES;
+            *next_cancel_check = next > line_no ? next : UINT64_MAX;
+        }
+        if (!aklv_candidate_has_all_container_grams(plan, containers, low)) {
+            continue;
+        }
+        if (!aklv_result_for_candidate_line(file,
+                                            line_no,
+                                            compiled,
+                                            exact_validation_needed,
+                                            out)) {
+            ok = false;
+            break;
+        }
+    }
+    return ok;
+}
+
+static bool aklv_collect_file_range_matches_with_plan(const AklvFile *file,
+                                                      const AklvPostingPlan *plan,
+                                                      uint64_t first_line,
+                                                      uint64_t last_line,
+                                                      const AklvCompiledQuery *compiled,
+                                                      uint64_t generation,
+                                                      const AklvSearchService *service,
+                                                      AklvResultVec *out) {
     if (file->mapped.size == 0 || file->index.count == 0 || first_line == 0 ||
-        compiled->pattern_len == 0) {
+        compiled->pattern_len == 0 || plan == NULL || plan->count == 0) {
         return true;
     }
     if (last_line > file->index.count) {
@@ -678,33 +1020,209 @@ static bool aklv_collect_file_range_matches(const AklvFile *file,
         return true;
     }
 
-    const AklvRoaring *driver = aklv_select_driver_posting(file, compiled);
-    if (driver == NULL) {
-        return true;
-    }
-    uint64_t next_cancel_check = first_line;
-    AklvRoaringIter iter;
-    aklv_roaring_iter_init(&iter, driver, first_line);
-    uint64_t line_no = 0;
-    while (aklv_roaring_iter_next(&iter, &line_no)) {
-        if (line_no > last_line) {
-            break;
+    const AklvRoaringContainer *stack_containers[AKLV_QUERY_INLINE_GRAMS];
+    const AklvRoaringContainer **containers = stack_containers;
+    uint64_t stack_container_indices[AKLV_QUERY_INLINE_GRAMS];
+    uint64_t *container_indices = stack_container_indices;
+    if (plan->count > sizeof(stack_containers) / sizeof(stack_containers[0])) {
+        containers = malloc(plan->count * sizeof(*containers));
+        if (containers == NULL) {
+            return false;
         }
-        if (line_no >= next_cancel_check) {
-            if (aklv_generation_cancelled(service, generation)) {
-                return false;
-            }
-            uint64_t next = line_no + AKLV_SEARCH_CANCEL_CHECK_LINES;
-            next_cancel_check = next > line_no ? next : UINT64_MAX;
-        }
-        if (!aklv_candidate_has_all_grams(file, compiled, driver, line_no)) {
-            continue;
-        }
-        if (!aklv_line_matches_at(file, line_no, compiled, out)) {
+        container_indices = malloc(plan->count * sizeof(*container_indices));
+        if (container_indices == NULL) {
+            free(containers);
             return false;
         }
     }
+    uint64_t next_cancel_check = first_line;
+    bool ok = true;
+    uint64_t first_key = first_line >> 16;
+    uint64_t last_key = last_line >> 16;
+    uint64_t first_container =
+        aklv_roaring_lower_bound_container_index(plan->items[0], first_key);
+    for (size_t i = 1; i < plan->count; i++) {
+        container_indices[i] = aklv_roaring_lower_bound_container_index(plan->items[i], first_key);
+    }
+    for (uint64_t ci = first_container; ci < plan->items[0]->count; ci++) {
+        const AklvRoaringContainer *container = &plan->items[0]->containers[ci];
+        if (container->key > last_key) {
+            break;
+        }
+        uint16_t min_low = container->key == first_key ? (uint16_t)(first_line & 0xffffU) : 0;
+        uint16_t max_low = container->key == last_key ? (uint16_t)(last_line & 0xffffU) : UINT16_MAX;
+        if (!aklv_collect_driver_container_matches(file,
+                                                   compiled,
+                                                   plan,
+                                                   containers,
+                                                   container_indices,
+                                                   container,
+                                                   min_low,
+                                                   max_low,
+                                                   generation,
+                                                   service,
+                                                   &next_cancel_check,
+                                                   out)) {
+            ok = false;
+            break;
+        }
+    }
+    if (containers != stack_containers) {
+        free(container_indices);
+        free(containers);
+    }
+    return ok;
+}
+
+static bool aklv_collect_file_range_matches_worker_plan(AklvSearchWorker *worker,
+                                                        const AklvFile *file,
+                                                        const AklvGramIndex *gram_index,
+                                                        uint64_t first_line,
+                                                        uint64_t last_line,
+                                                        const AklvCompiledQuery *compiled,
+                                                        uint64_t generation,
+                                                        const AklvSearchService *service,
+                                                        AklvResultVec *out) {
+    const AklvPostingPlan *plan = NULL;
+    bool has_candidates = false;
+    if (!aklv_worker_get_posting_plan(worker,
+                                      generation,
+                                      gram_index,
+                                      compiled,
+                                      &plan,
+                                      &has_candidates)) {
+        return false;
+    }
+    if (!has_candidates || plan == NULL) {
+        return true;
+    }
+    return aklv_collect_file_range_matches_with_plan(file,
+                                                     plan,
+                                                     first_line,
+                                                     last_line,
+                                                     compiled,
+                                                     generation,
+                                                     service,
+                                                     out);
+}
+
+static bool aklv_ranges_intersect(uint64_t a_first,
+                                  uint64_t a_last,
+                                  uint64_t b_first,
+                                  uint64_t b_last,
+                                  uint64_t *out_first,
+                                  uint64_t *out_last) {
+    uint64_t first = a_first > b_first ? a_first : b_first;
+    uint64_t last = a_last < b_last ? a_last : b_last;
+    if (first > last) {
+        return false;
+    }
+    if (out_first != NULL) {
+        *out_first = first;
+    }
+    if (out_last != NULL) {
+        *out_last = last;
+    }
     return true;
+}
+
+static bool aklv_collect_cached_file_range_matches(AklvSearchWorker *worker,
+                                                   const AklvFile *file,
+                                                   uint32_t shard_index,
+                                                   uint64_t first_line,
+                                                   uint64_t last_line,
+                                                   const AklvCompiledQuery *compiled,
+                                                   uint64_t generation,
+                                                   const AklvSearchService *service,
+                                                   AklvResultVec *out) {
+    AklvIndexCache *cache = (AklvIndexCache *)&file->index.cache;
+    if (!cache->available || cache->shard_count == 0) {
+        return aklv_collect_file_range_matches_worker_plan(worker,
+                                                           file,
+                                                           &file->index.gram_index,
+                                                           first_line,
+                                                           last_line,
+                                                           compiled,
+                                                           generation,
+                                                           service,
+                                                           out);
+    }
+    if (shard_index != UINT32_MAX && shard_index < cache->shard_count) {
+        AklvIndexCacheShard *shard = &cache->shards[shard_index];
+        uint64_t shard_first = 0;
+        uint64_t shard_last = 0;
+        if (!aklv_ranges_intersect(first_line,
+                                   last_line,
+                                   shard->first_line,
+                                   shard->last_line,
+                                   &shard_first,
+                                   &shard_last)) {
+            return true;
+        }
+        const AklvGramIndex *loaded_index = NULL;
+        char error[256] = {0};
+        if (aklv_index_cache_get_shard_index(cache,
+                                             shard,
+                                             &file->mapped,
+                                             &loaded_index,
+                                             error,
+                                             sizeof(error)) != 0 ||
+            loaded_index == NULL) {
+            return false;
+        }
+        return aklv_collect_file_range_matches_worker_plan(worker,
+                                                           file,
+                                                           loaded_index,
+                                                           shard_first,
+                                                           shard_last,
+                                                           compiled,
+                                                           generation,
+                                                           service,
+                                                           out);
+    }
+    bool ok = true;
+    for (uint32_t i = 0; i < cache->shard_count; i++) {
+        uint64_t shard_first = 0;
+        uint64_t shard_last = 0;
+        if (!aklv_ranges_intersect(first_line,
+                                   last_line,
+                                   cache->shards[i].first_line,
+                                   cache->shards[i].last_line,
+                                   &shard_first,
+                                   &shard_last)) {
+            continue;
+        }
+        if (aklv_generation_cancelled(service, generation)) {
+            ok = false;
+            break;
+        }
+        AklvIndexCacheShard *shard = &cache->shards[i];
+        const AklvGramIndex *shard_index = NULL;
+        char error[256] = {0};
+        if (aklv_index_cache_get_shard_index(cache,
+                                             shard,
+                                             &file->mapped,
+                                             &shard_index,
+                                             error,
+                                             sizeof(error)) != 0 ||
+            shard_index == NULL) {
+            ok = false;
+            break;
+        }
+        ok = aklv_collect_file_range_matches_worker_plan(worker,
+                                                         file,
+                                                         shard_index,
+                                                         shard_first,
+                                                         shard_last,
+                                                         compiled,
+                                                         generation,
+                                                         service,
+                                                         out);
+        if (!ok) {
+            break;
+        }
+    }
+    return ok;
 }
 
 static bool aklv_generation_cancelled(const AklvSearchService *service, uint64_t generation) {
@@ -713,14 +1231,12 @@ static bool aklv_generation_cancelled(const AklvSearchService *service, uint64_t
 }
 
 static bool aklv_worker_pop_task(AklvSearchService *service, AklvSearchTask *task_out) {
-    bool ok = false;
-    pthread_mutex_lock(&service->mutex);
-    if (service->next_task < service->task_count) {
-        *task_out = service->tasks[service->next_task++];
-        ok = true;
+    uint64_t index = atomic_fetch_add_explicit(&service->next_task, 1, memory_order_relaxed);
+    if (index >= service->task_count) {
+        return false;
     }
-    pthread_mutex_unlock(&service->mutex);
-    return ok;
+    *task_out = service->tasks[index];
+    return true;
 }
 
 static void *aklv_search_worker_main(void *arg) {
@@ -761,20 +1277,27 @@ static void *aklv_search_worker_main(void *arg) {
                 }
                 aklv_result_vec_clear(&worker->local_results);
                 AklvFile *file = job->snapshot.items[task.file_index];
-                aklv_collect_file_range_matches(file,
-                                                task.first_line,
-                                                task.last_line,
-                                                compiled,
-                                                generation,
-                                                service,
-                                                &worker->local_results);
+                aklv_collect_cached_file_range_matches(worker,
+                                                       file,
+                                                       task.shard_index,
+                                                       task.first_line,
+                                                       task.last_line,
+                                                       compiled,
+                                                       generation,
+                                                       service,
+                                                       &worker->local_results);
                 if (task.seq < service->task_count && !aklv_generation_cancelled(service, generation)) {
-                    aklv_result_vec_destroy(&service->task_results[task.seq]);
-                    service->task_results[task.seq] = worker->local_results;
-                    memset(&worker->local_results, 0, sizeof(worker->local_results));
+                    if (worker->local_results.count != 0) {
+                        aklv_result_vec_destroy(&service->task_results[task.seq]);
+                        service->task_results[task.seq] = worker->local_results;
+                        memset(&worker->local_results, 0, sizeof(worker->local_results));
+                    } else {
+                        aklv_result_vec_clear(&worker->local_results);
+                    }
                 }
             }
         }
+        aklv_worker_clear_posting_plan(worker);
 
         pthread_mutex_lock(&service->mutex);
         if (service->active_workers > 0) {
@@ -811,7 +1334,7 @@ static bool aklv_run_phase(AklvSearchService *service,
     service->tasks = tasks;
     service->task_results = task_results;
     service->task_count = task_count;
-    service->next_task = 0;
+    atomic_store_explicit(&service->next_task, 0, memory_order_relaxed);
     service->active_workers = service->thread_count;
     service->work_epoch++;
     pthread_cond_broadcast(&service->cond);
@@ -821,7 +1344,7 @@ static bool aklv_run_phase(AklvSearchService *service,
     service->tasks = NULL;
     service->task_results = NULL;
     service->task_count = 0;
-    service->next_task = 0;
+    atomic_store_explicit(&service->next_task, 0, memory_order_relaxed);
     bool ok = !service->stop && service->request_generation == generation;
     pthread_mutex_unlock(&service->mutex);
     if (!ok) {
@@ -834,11 +1357,63 @@ static bool aklv_run_phase(AklvSearchService *service,
     return ok;
 }
 
-static bool aklv_build_all_tasks(const AklvSearchJob *job, AklvSearchTaskVec *tasks) {
+static uint64_t aklv_search_count_chunks(uint64_t first_line, uint64_t last_line) {
+    if (first_line == 0 || last_line < first_line) {
+        return 0;
+    }
+    uint64_t line_count = last_line - first_line + 1;
+    return (line_count + AKLV_SEARCH_CHUNK_LINES - 1) / AKLV_SEARCH_CHUNK_LINES;
+}
+
+static bool aklv_estimate_all_task_count(const AklvSearchJob *job, uint64_t *count_out) {
+    uint64_t total = 0;
     for (uint32_t i = 0; i < job->snapshot.count; i++) {
         AklvFile *file = job->snapshot.items[i];
-        if (!aklv_task_vec_append_chunks(tasks, i, 1, file->index.count)) {
+        uint64_t add = 0;
+        if (file->index.cache.available && file->index.cache.shard_count > 0) {
+            for (uint32_t shard_i = 0; shard_i < file->index.cache.shard_count; shard_i++) {
+                AklvIndexCacheShard *shard = &file->index.cache.shards[shard_i];
+                uint64_t shard_tasks = aklv_search_count_chunks(shard->first_line, shard->last_line);
+                if (shard_tasks > UINT64_MAX - add) {
+                    return false;
+                }
+                add += shard_tasks;
+            }
+        } else {
+            add = aklv_search_count_chunks(1, file->index.count);
+        }
+        if (add > UINT64_MAX - total) {
             return false;
+        }
+        total += add;
+    }
+    *count_out = total;
+    return true;
+}
+
+static bool aklv_build_all_tasks(const AklvSearchJob *job, AklvSearchTaskVec *tasks) {
+    uint64_t task_count = 0;
+    if (!aklv_estimate_all_task_count(job, &task_count) ||
+        !aklv_task_vec_reserve(tasks, task_count)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < job->snapshot.count; i++) {
+        AklvFile *file = job->snapshot.items[i];
+        if (file->index.cache.available && file->index.cache.shard_count > 0) {
+            for (uint32_t shard_i = 0; shard_i < file->index.cache.shard_count; shard_i++) {
+                AklvIndexCacheShard *shard = &file->index.cache.shards[shard_i];
+                if (!aklv_task_vec_append_chunks(tasks,
+                                                 i,
+                                                 shard_i,
+                                                 shard->first_line,
+                                                 shard->last_line)) {
+                    return false;
+                }
+            }
+        } else {
+            if (!aklv_task_vec_append_chunks(tasks, i, UINT32_MAX, 1, file->index.count)) {
+                return false;
+            }
         }
     }
     return true;
@@ -865,6 +1440,7 @@ static void *aklv_search_coordinator_main(void *arg) {
         }
 
         service->active_job = service->queued_job;
+        aklv_compiled_query_rebind_inline(&service->active_job.compiled);
         memset(&service->queued_job, 0, sizeof(service->queued_job));
         service->queued_ready = false;
         service->job_running = true;
@@ -873,8 +1449,19 @@ static void *aklv_search_coordinator_main(void *arg) {
 
         AklvSearchTaskVec tasks = {0};
         AklvResultVec *phase_results = NULL;
-        bool ok = aklv_build_all_tasks(&service->active_job, &tasks);
-        if (ok) {
+        bool ok = true;
+        if (service->active_job.compiled.gram_count == 0) {
+            ok = aklv_publish_task_results(service,
+                                           generation,
+                                           service->active_job.query,
+                                           aklv_job_elapsed_sec(&service->active_job),
+                                           NULL,
+                                           0,
+                                           true);
+        } else {
+            ok = aklv_build_all_tasks(&service->active_job, &tasks);
+        }
+        if (ok && tasks.count != 0) {
             ok = aklv_run_phase(service,
                                 generation,
                                 tasks.items,
@@ -972,6 +1559,7 @@ void aklv_search_service_destroy(AklvSearchService *service) {
                 pthread_join(worker->thread, NULL);
             }
             aklv_result_vec_destroy(&worker->local_results);
+            aklv_worker_clear_posting_plan(worker);
         }
         free(service->workers);
     }
@@ -1003,6 +1591,7 @@ void aklv_search_service_submit(AklvSearchService *service,
     atomic_store_explicit(&service->cancel_generation, service->request_generation, memory_order_release);
     aklv_search_job_destroy(&service->queued_job);
     service->queued_job = new_job;
+    aklv_compiled_query_rebind_inline(&service->queued_job.compiled);
     memset(&new_job, 0, sizeof(new_job));
     service->queued_ready = true;
     aklv_search_results_clear(&service->pending);
@@ -1042,13 +1631,27 @@ void aklv_search_results_swap_from_service(AklvSearchService *service, AklvSearc
         return;
     }
     pthread_mutex_lock(&service->mutex);
+    uint64_t pending_generation = service->pending.generation;
+    uint64_t pending_count = service->pending.count;
+    pthread_mutex_unlock(&service->mutex);
+
+    if (target->generation != pending_generation || target->count > pending_count) {
+        target->count = 0;
+        target->generation = pending_generation;
+    }
+    if (pending_count > target->count &&
+        !aklv_search_results_reserve(target, pending_count)) {
+        return;
+    }
+
+    pthread_mutex_lock(&service->mutex);
     if (target->generation != service->pending.generation || target->count > service->pending.count) {
         target->count = 0;
         target->generation = service->pending.generation;
     }
     if (service->pending.count > target->count) {
         uint64_t old_count = target->count;
-        if (aklv_search_results_reserve(target, service->pending.count)) {
+        if (service->pending.count <= target->capacity) {
             memcpy(target->items + old_count,
                    service->pending.items + old_count,
                    (size_t)(service->pending.count - old_count) * sizeof(*target->items));

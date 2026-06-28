@@ -268,11 +268,119 @@ static int test_search_service_roaring_index(void) {
     return rc;
 }
 
+static int test_index_cache_reopen(void) {
+    char path[] = "/tmp/aklv_cache_selftest_XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        perror("mkstemp");
+        return 1;
+    }
+    FILE *stream = fdopen(fd, "w");
+    if (stream == NULL) {
+        perror("fdopen");
+        close(fd);
+        unlink(path);
+        return 1;
+    }
+    for (int i = 0; i < 20000; i++) {
+        fprintf(stream, "[meta %d!line=%d common token payload target_%d\n", i, i, i % 7);
+    }
+    if (fclose(stream) != 0) {
+        perror("fclose");
+        unlink(path);
+        return 1;
+    }
+
+    atomic_bool cancel;
+    atomic_init(&cancel, false);
+    AklvFile *first = NULL;
+    char error[256] = {0};
+    if (aklv_file_open_path(path, 1, &cancel, &first, error, sizeof(error)) != 0) {
+        fprintf(stderr, "cache first open failed: %s\n", error);
+        unlink(path);
+        return 1;
+    }
+    if (!first->index.cache.available || first->index.cache.shard_count == 0 ||
+        first->index.gram_index.count != 0) {
+        fprintf(stderr, "cache was not stored after first open\n");
+        aklv_file_release(first);
+        unlink(path);
+        return 1;
+    }
+    aklv_file_release(first);
+
+    AklvFile *file = NULL;
+    memset(error, 0, sizeof(error));
+    if (aklv_file_open_path(path, 2, &cancel, &file, error, sizeof(error)) != 0) {
+        fprintf(stderr, "cache reopen failed: %s\n", error);
+        unlink(path);
+        return 1;
+    }
+    if (!file->index.cache.available || file->index.cache.shard_count == 0 ||
+        file->index.gram_index.count != 0 || file->index.count != 20000) {
+        fprintf(stderr, "cache metadata mismatch on reopen\n");
+        aklv_file_release(file);
+        unlink(path);
+        return 1;
+    }
+    AklvLineView view = aklv_file_line_fast(file, 1);
+    const char expected_first_line[] = "[meta 0!line=0 common token payload target_0";
+    if (view.len < strlen(expected_first_line) ||
+        memcmp(view.start, expected_first_line, strlen(expected_first_line)) != 0) {
+        fprintf(stderr, "cache-backed line view mismatch\n");
+        aklv_file_release(file);
+        unlink(path);
+        return 1;
+    }
+
+    AklvSearchService *service = aklv_search_service_create();
+    if (service == NULL) {
+        aklv_file_release(file);
+        unlink(path);
+        return 1;
+    }
+    AklvFile *items[1] = {file};
+    AklvFileSnapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.items = items;
+    snapshot.count = 1;
+
+    AklvSearchResults results;
+    aklv_search_results_init(&results);
+    aklv_search_service_submit(service, "target_3", &snapshot);
+    int rc = 0;
+    if (wait_for_search(service, &results) != 0 ||
+        results.count != 2857 ||
+        results.items[0].line_no != 4 ||
+        results.items[results.count - 1].line_no != 19996 ||
+        !file->index.cache.shards[0].gram_index_loaded) {
+        fprintf(stderr, "cache-backed search failed: count=%" PRIu64 "\n", results.count);
+        rc = 1;
+    }
+    if (rc == 0) {
+        aklv_search_service_submit(service, "common", &snapshot);
+        if (wait_for_search(service, &results) != 0 ||
+            results.count != 20000 ||
+            results.items[0].line_no != 1 ||
+            results.items[results.count - 1].line_no != 20000) {
+            fprintf(stderr, "cache-backed run chunk search failed: count=%" PRIu64 "\n", results.count);
+            rc = 1;
+        }
+    }
+
+    aklv_search_results_destroy(&results);
+    aklv_search_service_destroy(service);
+    aklv_file_release(file);
+    unlink(path);
+    return rc;
+}
+
 int main(void) {
     if (test_effective_line() != 0 ||
         test_index() != 0 ||
         test_search_service_stream() != 0 ||
         test_search_service_roaring_index() != 0 ||
+        test_index_cache_reopen() != 0 ||
         aklv_search_selftest() != 0) {
         return 1;
     }

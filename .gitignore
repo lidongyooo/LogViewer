@@ -1,1 +1,4 @@
 build
+indexs/
+.idea
+.DS_Store

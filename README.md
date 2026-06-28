@@ -67,6 +67,11 @@ The index is optimized for exact search over very large trace/log files:
 - block-based line-offset index, 65536 lines per block
 - ASCII-derived 3-byte fragment inverted index backed by lightweight
   Roaring-style bitmaps of line numbers
+- finished indexes are cached under `indexs/` as `<md5>_N.index` shards, where
+  the MD5 input is the resolved full path plus basename; shards are capped at
+  1 GiB serialized size
+- reopening an unchanged file restores line offsets from cache and loads only
+  one index shard per file at a time while searching
 - index construction is split into a sequential line-offset pass and a
   parallel per-line-range gram build/merge pass
 - search-effective line content skips the prefix from line start through `!` when the line starts with `[`
@@ -77,10 +82,11 @@ The Roaring inverted index is built from every 3-byte window inside ASCII
 indexable runs. 1-byte and 2-byte fragments are intentionally not indexed,
 because the backend assumes submitted searches are at least 3 characters.
 During indexing, duplicate fragments inside a single line are deduplicated
-with a reusable per-worker scratch hash table before posting updates, avoiding
+with a reusable per-worker dense bitset before posting updates, avoiding
 per-line allocation/sort churn. Posting lists use adaptive Roaring-style
-containers: small sorted arrays for sparse ranges and full bitmaps for
-high-cardinality ranges. The index is a
+containers: small sorted arrays for sparse ranges, full bitmaps for
+high-cardinality ranges, run containers for contiguous ranges, and full
+containers for saturated ranges. The index is a
 candidate generator only; every candidate line is still validated against the
 mmap-backed original line.
 
@@ -94,9 +100,10 @@ mmap-backed original line.
   iterate Roaring candidates in parallel and append result batches as tasks
   complete.
 - Search extracts 3-byte ASCII fragments from the case-folded query, chooses the
-  lowest-cardinality posting as the driver, intersects remaining postings by
-  bitmap membership checks, then performs mmap-backed SIMD/BMH exact validation
-  on candidate lines.
+  lowest-cardinality posting as the driver after sorting query postings by
+  cardinality, intersects remaining postings at Roaring-container granularity
+  with bitmap/full-container AND fast paths, then performs mmap-backed SIMD/BMH
+  exact validation on candidate lines.
 - Queries with no 3-byte ASCII fragment produce no Roaring candidates and
   therefore return no matches; the log-viewer backend does not run whole-file
   searches without inverted-index candidates.

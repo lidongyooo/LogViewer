@@ -61,6 +61,12 @@ $(BUILD_DIR):
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(COMMON_CFLAGS) $(SDL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/aklv_index.o: $(SRC_DIR)/aklv_index.h
+$(BUILD_DIR)/aklv_search.o: $(SRC_DIR)/aklv_index.h $(SRC_DIR)/aklv_search.h
+$(BUILD_DIR)/aklv_loader.o: $(SRC_DIR)/aklv_index.h $(SRC_DIR)/aklv_loader.h
+$(BUILD_DIR)/main.o: $(SRC_DIR)/aklv_index.h $(SRC_DIR)/aklv_search.h $(SRC_DIR)/aklv_loader.h $(SRC_DIR)/aklv_metal.h $(SRC_DIR)/aklv_platform.h
+$(BUILD_DIR)/selftest.o: $(SRC_DIR)/aklv_index.h $(SRC_DIR)/aklv_search.h
+
 $(BUILD_DIR)/aklv_metal.o: $(SRC_DIR)/aklv_metal.m | $(BUILD_DIR)
 	$(OBJC) $(COMMON_CFLAGS) $(OBJCFLAGS) $(SDL_CFLAGS) -c $< -o $@
 

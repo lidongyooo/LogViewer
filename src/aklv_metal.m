@@ -89,6 +89,26 @@ static vector_float4 aklv_color_vec(AklvColor c) {
     return (vector_float4){c.r, c.g, c.b, c.a};
 }
 
+static void aklv_push_quad_uv_reserved(AklvMetalRenderer *renderer,
+                                       float x,
+                                       float y,
+                                       float w,
+                                       float h,
+                                       float u0,
+                                       float v0,
+                                       float u1,
+                                       float v1,
+                                       vector_float4 c) {
+    AklvVertex *v = renderer->vertices + renderer->vertex_count;
+    v[0] = (AklvVertex){(vector_float2){x, y}, (vector_float2){u0, v0}, c};
+    v[1] = (AklvVertex){(vector_float2){x + w, y}, (vector_float2){u1, v0}, c};
+    v[2] = (AklvVertex){(vector_float2){x, y + h}, (vector_float2){u0, v1}, c};
+    v[3] = (AklvVertex){(vector_float2){x + w, y}, (vector_float2){u1, v0}, c};
+    v[4] = (AklvVertex){(vector_float2){x + w, y + h}, (vector_float2){u1, v1}, c};
+    v[5] = (AklvVertex){(vector_float2){x, y + h}, (vector_float2){u0, v1}, c};
+    renderer->vertex_count += 6;
+}
+
 static void aklv_push_quad_uv(AklvMetalRenderer *renderer,
                               float x,
                               float y,
@@ -103,14 +123,7 @@ static void aklv_push_quad_uv(AklvMetalRenderer *renderer,
         return;
     }
     vector_float4 c = aklv_color_vec(color);
-    AklvVertex *v = renderer->vertices + renderer->vertex_count;
-    v[0] = (AklvVertex){(vector_float2){x, y}, (vector_float2){u0, v0}, c};
-    v[1] = (AklvVertex){(vector_float2){x + w, y}, (vector_float2){u1, v0}, c};
-    v[2] = (AklvVertex){(vector_float2){x, y + h}, (vector_float2){u0, v1}, c};
-    v[3] = (AklvVertex){(vector_float2){x + w, y}, (vector_float2){u1, v0}, c};
-    v[4] = (AklvVertex){(vector_float2){x + w, y + h}, (vector_float2){u1, v1}, c};
-    v[5] = (AklvVertex){(vector_float2){x, y + h}, (vector_float2){u0, v1}, c};
-    renderer->vertex_count += 6;
+    aklv_push_quad_uv_reserved(renderer, x, y, w, h, u0, v0, u1, v1, c);
 }
 
 static bool aklv_metal_create_pipeline(AklvMetalRenderer *renderer, char *error, size_t error_cap) {
@@ -478,6 +491,16 @@ void aklv_metal_push_text(AklvMetalRenderer *renderer,
     }
     float cursor = x;
     float max_x = (float)renderer->drawable_width / renderer->ui_scale;
+    if (renderer->char_width > 0.0f) {
+        size_t visible_cap = (size_t)((max_x > x ? max_x - x : 0.0f) / renderer->char_width) + 2;
+        if (len > visible_cap) {
+            len = visible_cap;
+        }
+    }
+    if (!aklv_metal_reserve(renderer, len * 6)) {
+        return;
+    }
+    vector_float4 cvec = aklv_color_vec(color);
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)text[i];
         if (c == '\0') {
@@ -494,7 +517,16 @@ void aklv_metal_push_text(AklvMetalRenderer *renderer,
             break;
         }
         AklvGlyph *g = &renderer->glyphs[c];
-        aklv_push_quad_uv(renderer, cursor, y, g->w, g->h, g->u0, g->v0, g->u1, g->v1, color);
+        aklv_push_quad_uv_reserved(renderer,
+                                   cursor,
+                                   y,
+                                   g->w,
+                                   g->h,
+                                   g->u0,
+                                   g->v0,
+                                   g->u1,
+                                   g->v1,
+                                   cvec);
         cursor += g->advance;
     }
 }
