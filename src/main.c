@@ -998,7 +998,10 @@ static void aklv_app_handle_search(AklvApp *app) {
         int win_h = 0;
         float scale = 1.0f;
         aklv_get_window_points(app->window, &win_w, &win_h, &scale);
-        aklv_app_select_next_result_after_active_line(app, win_w, win_h);
+        if (aklv_app_select_next_result_after_active_line(app, win_w, win_h)) {
+            app->search_input_focus = false;
+            app->search_select_all = false;
+        }
     }
     if (app->search_results.complete && changed) {
         aklv_app_set_status(app,
